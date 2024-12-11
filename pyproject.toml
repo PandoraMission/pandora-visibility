@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "pandoravisibility"
+version = "0.1.0"
+description = "AA tool for calculating the visibility of targets from Pandoraa"
+authors = ["Tom Barclay <barclay.astro@gmail.com>"]
+license = "BSD-3-Clause license"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+numpy = "^2.2.0"
+astropy = "^7.0.0"
+sgp4 = "^2.23"
+
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.4"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
