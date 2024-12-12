@@ -11,9 +11,9 @@ __all__ = ["Visibility"]
 class Visibility:
     """A class to handle Two-Line Element (TLE) data and target visibility."""
 
-    MOON_MIN = 25 * u.deg  # Minimum allowable moon distance
+    MOON_MIN = 20 * u.deg  # Minimum allowable moon distance
     SUN_MIN = 90 * u.deg  # Minimum allowable sun distance
-    EARTHLIMB_MIN = 20 * u.deg  # Minimum allowable Earth limb distance
+    EARTHLIMB_MIN = 10 * u.deg  # Minimum allowable Earth limb distance
 
     def __init__(self, line1: str, line2: str):
         """
@@ -162,14 +162,20 @@ class Visibility:
         observer_location = EarthLocation.from_geocentric(state.x, state.y, state.z)
 
         moon_coord = get_body("moon", time=self.time, location=observer_location)
-        moon_vis = moon_coord.separation(target_coord) >= self.MOON_MIN
+        moon_vis = (
+            moon_coord.separation(target_coord, origin_mismatch="ignore")
+            >= self.MOON_MIN
+        )
 
         sun_coord = get_body("sun", time=self.time, location=observer_location)
-        sun_vis = moon_coord.separation(target_coord) >= self.SUN_MIN
+        sun_vis = (
+            moon_coord.separation(target_coord, origin_mismatch="ignore")
+            >= self.SUN_MIN
+        )
 
         earthlimb_vis = (
             self._get_angle_from_earth_limb(observer_location, target_coord, self.time)
-            >= min_angle
+            >= self.EARTHLIMB_MIN
         )
 
         visibility = moon_vis * sun_vis * earthlimb_vis
