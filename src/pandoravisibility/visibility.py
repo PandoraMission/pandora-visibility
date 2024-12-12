@@ -169,7 +169,7 @@ class Visibility:
 
         sun_coord = get_body("sun", time=self.time, location=observer_location)
         sun_vis = (
-            moon_coord.separation(target_coord, origin_mismatch="ignore")
+            sun_coord.separation(target_coord, origin_mismatch="ignore")
             >= self.SUN_MIN
         )
 
