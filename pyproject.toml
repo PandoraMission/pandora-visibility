@@ -7,10 +7,10 @@ license = "BSD-3-Clause license"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.11"
+python = ">=3.9,<4.0"
 numpy = "^1.23.2"
-astropy = "^7.0.0"
 sgp4 = "^2.23"
+astropy = ">=5.0"
 
 
 [tool.poetry.group.dev.dependencies]
