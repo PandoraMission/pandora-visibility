@@ -27,6 +27,7 @@ def test_visibility():
     assert (vis.tle.a * u.earthRad - R_earth).to(u.km).value > 596
     assert (vis.tle.a * u.earthRad - R_earth).to(u.km).value < 597
 
+
 def test_target():
     # Example TLE lines (replace with actual TLE data)
     line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
@@ -50,9 +51,3 @@ def test_target():
 
     assert int(targ_vis.shape[0]) == 144
     assert targ_vis.astype(int).sum() == 85
-
-
-
-
-
-
