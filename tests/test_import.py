@@ -29,6 +29,8 @@ def test_visibility():
 
 def test_target():
     from astropy.time import Time, TimeDelta
+    import numpy as np
+    from astropy import units as u
 
     # Example TLE lines (replace with actual TLE data)
     line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
