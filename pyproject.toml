@@ -5,7 +5,9 @@ description = "A tool for calculating the visibility of targets from Pandoraa"
 authors = ["Tom Barclay <barclay.astro@gmail.com>"]
 license = "BSD-3-Clause license"
 readme = "README.md"
-
+packages = [
+    { include = "pandoravisibility", from = "src" }
+]
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4.0"
