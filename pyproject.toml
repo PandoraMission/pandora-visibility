@@ -1,10 +1,11 @@
 [tool.poetry]
 name = "pandoravisibility"
 version = "0.1.0"
-description = "AA tool for calculating the visibility of targets from Pandoraa"
+description = "A tool for calculating the visibility of targets from Pandoraa"
 authors = ["Tom Barclay <barclay.astro@gmail.com>"]
 license = "BSD-3-Clause license"
 readme = "README.md"
+
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4.0"
