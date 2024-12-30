@@ -1,4 +1,6 @@
 # pandora-visibility
+<a href="https://github.com/pandoramission/pandora-visibility/actions/workflows/python-package.yml"><img src="https://github.com/pandoramission/pandora-visibility/actions/workflows/python-package.yml/badge.svg" alt="Test status"/></a>
+
 Tool for calculating the visibility of targets from Pandora
 
 
