@@ -11,7 +11,7 @@ __all__ = ["Visibility"]
 class Visibility:
     """A class to handle Two-Line Element (TLE) data and target visibility."""
 
-    MOON_MIN = 20 * u.deg  # Minimum allowable moon distance
+    MOON_MIN = 25 * u.deg  # Minimum allowable moon distance
     SUN_MIN = 90 * u.deg  # Minimum allowable sun distance
     EARTHLIMB_MIN = 10 * u.deg  # Minimum allowable Earth limb distance
 
