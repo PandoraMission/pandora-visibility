@@ -11,11 +11,14 @@ __all__ = ["Visibility"]
 class Visibility:
     """A class to handle Two-Line Element (TLE) data and target visibility."""
 
-    MOON_MIN = 25 * u.deg  # Minimum allowable moon distance
-    SUN_MIN = 91 * u.deg  # Minimum allowable sun distance
-    EARTHLIMB_MIN = 20 * u.deg  # Minimum allowable Earth limb distance
+    # Default constants - can be overridden per instance
+    MOON_MIN = 25 * u.deg
+    SUN_MIN = 91 * u.deg
+    EARTHLIMB_MIN = 20 * u.deg
+    MARS_MIN = 0 * u.deg
+    JUPITER_MIN = 0 * u.deg
 
-    def __init__(self, line1: str, line2: str):
+    def __init__(self, line1: str, line2: str, **custom_limits):
         """
         Initialize the TLE object with the two lines of TLE data.
 
@@ -24,8 +27,17 @@ class Visibility:
             The first line of the TLE.
         line2 : str
             The second line of the TLE.
+        **custom_limits : dict
+            Optional custom limits (e.g., moon_min=30*u.deg)
         """
         self.tle = Satrec.twoline2rv(line1, line2)
+
+        # Set instance limits (use class defaults if not provided)
+        self.moon_min = custom_limits.get("moon_min", self.MOON_MIN)
+        self.sun_min = custom_limits.get("sun_min", self.SUN_MIN)
+        self.earthlimb_min = custom_limits.get("earthlimb_min", self.EARTHLIMB_MIN)
+        self.mars_min = custom_limits.get("mars_min", self.MARS_MIN)
+        self.jupiter_min = custom_limits.get("jupiter_min", self.JUPITER_MIN)
 
     def __repr__(self) -> str:
         """Return a string representation of the TLE object for debugging."""
@@ -108,9 +120,9 @@ class Visibility:
         """
         # Map body names to the corresponding minimum separation
         body_min_map = {
-            "moon": self.MOON_MIN,
-            "sun": self.SUN_MIN,
-            "earthlimb": self.EARTHLIMB_MIN,
+            "moon": self.moon_min,
+            "sun": self.sun_min,
+            "earthlimb": self.earthlimb_min,
         }
 
         if body not in body_min_map:
@@ -164,18 +176,17 @@ class Visibility:
         moon_coord = get_body("moon", time=self.time, location=observer_location)
         moon_vis = (
             moon_coord.separation(target_coord, origin_mismatch="ignore")
-            >= self.MOON_MIN
+            >= self.moon_min
         )
 
         sun_coord = get_body("sun", time=self.time, location=observer_location)
         sun_vis = (
-            sun_coord.separation(target_coord, origin_mismatch="ignore")
-            >= self.SUN_MIN
+            sun_coord.separation(target_coord, origin_mismatch="ignore") >= self.sun_min
         )
 
         earthlimb_vis = (
             self._get_angle_from_earth_limb(observer_location, target_coord, self.time)
-            >= self.EARTHLIMB_MIN
+            >= self.earthlimb_min
         )
 
         visibility = moon_vis * sun_vis * earthlimb_vis
