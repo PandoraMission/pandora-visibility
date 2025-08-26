@@ -30,7 +30,14 @@ class Visibility:
         **custom_limits : dict
             Optional custom limits (e.g., moon_min=30*u.deg)
         """
-        self.tle = Satrec.twoline2rv(line1, line2)
+        # Validate TLE lines
+        if not line1 or not line2:
+            raise ValueError("TLE lines cannot be empty")
+
+        try:
+            self.tle = Satrec.twoline2rv(line1, line2)
+        except Exception as e:
+            raise ValueError(f"Invalid TLE data: {e}")
 
         # Set instance limits (use class defaults if not provided)
         self.moon_min = custom_limits.get("moon_min", self.MOON_MIN)
@@ -41,7 +48,20 @@ class Visibility:
 
     def __repr__(self) -> str:
         """Return a string representation of the TLE object for debugging."""
-        return f"<TLE: {self.tle.satnum}>"
+        constraints = []
+        if self.moon_min > 0 * u.deg:
+            constraints.append(f"moon≥{self.moon_min:.0f}")
+        if self.sun_min > 0 * u.deg:
+            constraints.append(f"sun≥{self.sun_min:.0f}")
+        if self.earthlimb_min > 0 * u.deg:
+            constraints.append(f"limb≥{self.earthlimb_min:.0f}")
+        if self.mars_min > 0 * u.deg:
+            constraints.append(f"mars≥{self.mars_min:.0f}")
+        if self.jupiter_min > 0 * u.deg:
+            constraints.append(f"jupiter≥{self.jupiter_min:.0f}")
+
+        constraint_str = ", ".join(constraints) if constraints else "default"
+        return f"<Visibility: SAT{self.tle.satnum} [{constraint_str}]>"
 
     def get_period(self) -> u.Quantity:
         """
@@ -110,7 +130,7 @@ class Visibility:
         target_coord : SkyCoord
             The target coordinate to compare with.
         body : str
-            The celestial body (e.g., "moon", "sun", "earthlimb").
+            The celestial body (e.g., "moon", "sun", "earthlimb", "mars", "jupiter").
         time : astropy.time.Time
             The time at which to calculate the constraint.
 
@@ -123,6 +143,8 @@ class Visibility:
             "moon": self.moon_min,
             "sun": self.sun_min,
             "earthlimb": self.earthlimb_min,
+            "jupiter": self.jupiter_min,
+            "mars": self.mars_min,
         }
 
         if body not in body_min_map:
@@ -133,13 +155,11 @@ class Visibility:
         min_angle = body_min_map[body]
 
         # Calculate observer's geocentric position
-        self.time = time
-        state = self.get_state()
-        observer_location = EarthLocation.from_geocentric(state.x, state.y, state.z)
+        observer_location = self._get_observer_location(time)
 
-        if body in ["moon", "sun"]:
+        if body in ["moon", "sun", "mars", "jupiter"]:
             # Compute angular separation between the body and the target
-            body_coord = get_body(body, time=self.time, location=observer_location)
+            body_coord = get_body(body, time=time, location=observer_location)
             return (
                 body_coord.separation(target_coord, origin_mismatch="ignore")
                 >= min_angle
@@ -148,49 +168,63 @@ class Visibility:
         elif body == "earthlimb":
             # Calculate angular distance from the Earth's limb
             return (
-                self._get_angle_from_earth_limb(
-                    observer_location, target_coord, self.time
-                )
+                self._get_angle_from_earth_limb(observer_location, target_coord, time)
                 >= min_angle
             )
 
-    def get_visibility(self, target_coord: SkyCoord, time: Time) -> bool:
+    def _get_observer_location(self, time: Time) -> EarthLocation:
+        """Helper method to get observer location without side effects."""
+        # Temporarily set time for state calculation
+        original_time = getattr(self, "time", None)
+        self.time = time
+        try:
+            state = self.get_state()
+            return EarthLocation.from_geocentric(state.x, state.y, state.z)
+        finally:
+            if original_time is not None:
+                self.time = original_time
+            elif hasattr(self, "time"):
+                delattr(self, "time")
+
+    def get_visibility(self, target_coord: SkyCoord, time: Time):
         """
-        Calculate whether the target is visible based on constraints.
+        Calculate whether the target is visible based on all constraints.
 
         Parameters:
+        -----------
         target_coord : SkyCoord
             The target coordinate to compare with.
         time : astropy.time.Time
-            The time at which to calculate the constraint.
+            The time at which to calculate the constraint. Can be scalar or array.
 
         Returns:
-        bool
+        --------
+        bool or np.ndarray
             True if the target is visible, False otherwise.
+            Returns array if time is an array.
         """
+        # Always check these constraints
+        required_constraints = ["moon", "sun", "earthlimb"]
 
-        self.time = time
-        state = self.get_state()
-        observer_location = EarthLocation.from_geocentric(state.x, state.y, state.z)
+        # Add planetary constraints if enabled
+        if self.mars_min > 0 * u.deg:
+            required_constraints.append("mars")
+        if self.jupiter_min > 0 * u.deg:
+            required_constraints.append("jupiter")
 
-        moon_coord = get_body("moon", time=self.time, location=observer_location)
-        moon_vis = (
-            moon_coord.separation(target_coord, origin_mismatch="ignore")
-            >= self.moon_min
-        )
+        # Start with the first constraint
+        result = self.get_constraint(target_coord, required_constraints[0], time)
 
-        sun_coord = get_body("sun", time=self.time, location=observer_location)
-        sun_vis = (
-            sun_coord.separation(target_coord, origin_mismatch="ignore") >= self.sun_min
-        )
+        # Apply remaining constraints using bitwise AND
+        for constraint in required_constraints[1:]:
+            constraint_result = self.get_constraint(target_coord, constraint, time)
+            result = result & constraint_result
 
-        earthlimb_vis = (
-            self._get_angle_from_earth_limb(observer_location, target_coord, self.time)
-            >= self.earthlimb_min
-        )
-
-        visibility = moon_vis * sun_vis * earthlimb_vis
-        return visibility
+        # Return scalar if input was scalar
+        if time.isscalar:
+            return bool(result)
+        else:
+            return result
 
     @staticmethod
     def _get_angle_from_earth_limb(
@@ -224,3 +258,103 @@ class Visibility:
             limb_angle = np.arccos(R_earth / observer_distance)
 
         return alt + limb_angle
+
+    def get_all_constraints(self, target_coord: SkyCoord, time: Time) -> dict:
+        """Get status of all active constraints."""
+        constraints = {
+            "moon": self.get_constraint(target_coord, "moon", time),
+            "sun": self.get_constraint(target_coord, "sun", time),
+            "earthlimb": self.get_constraint(target_coord, "earthlimb", time),
+        }
+
+        if self.mars_min > 0 * u.deg:
+            constraints["mars"] = self.get_constraint(target_coord, "mars", time)
+
+        if self.jupiter_min > 0 * u.deg:
+            constraints["jupiter"] = self.get_constraint(target_coord, "jupiter", time)
+
+        return constraints
+
+    def get_separations(self, target_coord: SkyCoord, time: Time) -> dict:
+        """Get actual separation angles from all bodies."""
+        observer_location = self._get_observer_location(time)
+        separations = {}
+
+        for body in ["moon", "sun", "mars", "jupiter"]:
+            body_coord = get_body(body, time=time, location=observer_location)
+            separations[body] = body_coord.separation(
+                target_coord, origin_mismatch="ignore"
+            )
+
+        separations["earthlimb"] = self._get_angle_from_earth_limb(
+            observer_location, target_coord, time
+        )
+        return separations  # Add this line!
+
+
+    def summary(self, target_coord: SkyCoord, time: Time) -> str:
+        """
+        Get a human-readable summary of visibility constraints.
+
+        Parameters:
+        -----------
+        target_coord : SkyCoord
+            The target coordinate to analyze.
+        time : Time
+            The observation time. Must be scalar (single time point).
+
+        Returns:
+        --------
+        str
+            Formatted summary of all visibility constraints.
+
+        Raises:
+        -------
+        ValueError
+            If time is not scalar (array inputs not supported).
+        """
+        # Enforce scalar time restriction
+        if not time.isscalar:
+            raise ValueError(
+                "summary() only supports scalar time inputs. "
+                "Use get_visibility() or get_all_constraints() for array inputs."
+            )
+
+        try:
+            constraints = self.get_all_constraints(target_coord, time)
+            separations = self.get_separations(target_coord, time)
+        except Exception as e:
+            return f"Error calculating visibility: {e}"
+
+        # Better coordinate formatting
+        coord_str = target_coord.to_string("hmsdms", precision=1)
+        if len(coord_str) > 35:
+            coord_str = coord_str[:32] + "..."
+
+        lines = [
+            f"Visibility Summary",
+            f"Target: {coord_str}",
+            f"Time:   {time.iso}",
+            f"Sat:    {self.tle.satnum}",
+            "=" * 60,
+        ]
+
+        for body in constraints:
+            status = "PASS" if constraints[body] else "FAIL"
+            status_symbol = "✓" if constraints[body] else "✗"
+            min_sep = getattr(self, f"{body}_min")
+            actual_sep = separations[body]
+
+            lines.append(
+                f"{body.capitalize():<10} {status_symbol} {status:<4} "
+                f"(req: {min_sep:>6.1f}, actual: {actual_sep:>6.1f})"
+            )
+
+        overall_status = (
+            "VISIBLE" if self.get_visibility(target_coord, time) else "NOT VISIBLE"
+        )
+        overall_symbol = "✓" if overall_status == "VISIBLE" else "✗"
+
+        lines.extend(["=" * 60, f"Overall: {overall_symbol} {overall_status}"])
+
+        return "\n".join(lines)

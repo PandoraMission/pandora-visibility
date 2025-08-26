@@ -31,7 +31,7 @@ def test_visibility():
 
 
 def test_target():
-    # Example TLE lines (replace with actual TLE data)
+    # Example TLE lines
     line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
     line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
 
@@ -61,14 +61,15 @@ def test_target():
 
 
 def test_custom_limits():
-    # Example TLE lines (replace with actual TLE data)
+    # Example TLE lines
     line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
     line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
 
     from astropy import units as u
 
     vis = Visibility(
-        line1, line2, moon_min=20 * u.deg, earthlimb_min=10 * u.deg, sun_min=90 * u.deg
+        line1, line2, moon_min=20 * u.deg, earthlimb_min=10 * u.deg, sun_min=90 * u.deg,
+        jupiter_min=0 * u.deg, mars_min=0 * u.deg
     )
 
     from astropy.time import Time, TimeDelta
@@ -91,3 +92,29 @@ def test_custom_limits():
 
     assert int(targ_vis.shape[0]) == 144
     assert targ_vis.astype(int).sum() == 85
+
+
+def test_edge_cases():
+    """Test edge cases and boundary conditions."""
+    from astropy.time import Time
+    from astropy.coordinates import SkyCoord
+    from astropy import units as u
+    
+    line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
+    line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+    
+    vis = Visibility(line1, line2)
+    target_coord = SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
+    time = Time("2025-01-01T00:00:00")
+    
+    # Test with zero constraints
+    vis_zero = Visibility(line1, line2, moon_min=0*u.deg, sun_min=0*u.deg, 
+                         earthlimb_min=-90*u.deg)
+    result = vis_zero.get_visibility(target_coord, time)
+    assert isinstance(result, bool)
+    assert result == True
+    
+    # Test with very high constraints (should always fail)
+    vis_high = Visibility(line1, line2, moon_min=180*u.deg)
+    result = vis_high.get_visibility(target_coord, time)
+    assert result == False
