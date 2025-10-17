@@ -9,7 +9,43 @@ __all__ = ["Visibility"]
 
 
 class Visibility:
-    """A class to handle Two-Line Element (TLE) data and target visibility."""
+    """
+    A class to handle Two-Line Element (TLE) data and target visibility.
+    
+    This class provides functionality to:
+    - Calculate satellite positions from TLE data
+    - Determine visibility of astronomical targets based on constraints
+    - Analyze observation windows and duty cycles
+    - Support visualization of visibility data
+    
+    Examples:
+    ---------
+    >>> # Initialize with TLE data
+    >>> vis = Visibility(line1, line2)
+    >>> 
+    >>> # Check visibility for a single target and time
+    >>> from astropy.coordinates import SkyCoord
+    >>> from astropy.time import Time
+    >>> target = SkyCoord(ra=79.17, dec=45.99, unit="deg")
+    >>> time = Time("2026-01-15T00:00:00")
+    >>> is_visible = vis.get_visibility(target, time)
+    >>> print(vis.summary(target, time))
+    >>> 
+    >>> # Analyze visibility over a time period
+    >>> times = Time("2026-01-01") + np.arange(365) * u.day
+    >>> visibility = vis.get_visibility(target, times)
+    >>> 
+    >>> # Plot visibility timeline
+    >>> import matplotlib.pyplot as plt
+    >>> plt.figure(figsize=(12,4))
+    >>> plt.plot(times.utc, visibility)
+    >>> plt.xlabel("Time")
+    >>> plt.ylabel("Visibility")
+    
+    See Also:
+    ---------
+    sgp4.api.Satrec : Low-level access to SGP4 propagator
+    """
 
     # Default constants - can be overridden per instance
     MOON_MIN = 25 * u.deg
@@ -289,7 +325,7 @@ class Visibility:
         separations["earthlimb"] = self._get_angle_from_earth_limb(
             observer_location, target_coord, time
         )
-        return separations  # Add this line!
+        return separations  
 
 
     def summary(self, target_coord: SkyCoord, time: Time) -> str:
