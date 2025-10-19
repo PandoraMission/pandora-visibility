@@ -11,6 +11,7 @@ python = ">=3.10,<4.0"
 numpy = "^1.23.2"
 sgp4 = "^2.23"
 astropy = ">=6.1"
+pandas = "^2.2.3"
 
 
 [tool.poetry.group.dev.dependencies]
