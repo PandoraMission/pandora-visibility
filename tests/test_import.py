@@ -1,4 +1,19 @@
 from pandoravisibility import Visibility
+import numpy as np
+from packaging import version
+
+
+def test_numpy_compatibility():
+    """Test that numpy version is >= 1.26 and imports work correctly."""
+    numpy_version = version.parse(np.__version__)
+    min_version = version.parse("1.26.0")
+    assert numpy_version >= min_version, \
+        f"NumPy version {np.__version__} is less than {min_version}"
+
+    # Verify numpy can be imported and basic operations work
+    test_array = np.array([1, 2, 3])
+    assert test_array.sum() == 6
+    assert test_array.shape == (3,)
 
 
 def test_visibility():
@@ -42,7 +57,6 @@ def test_target():
     tstart = Time("2025-01-01T00:00:00.000")
     tstop = Time("2025-01-02T00:00:00.000")  # Example stop time
 
-    import numpy as np
     from astropy import units as u
 
     dt = TimeDelta((1 / 144) * u.day, format="jd")  # 10 minutes in Julian days
@@ -76,8 +90,6 @@ def test_custom_limits():
 
     tstart = Time("2025-01-01T00:00:00.000")
     tstop = Time("2025-01-02T00:00:00.000")  # Example stop time
-
-    import numpy as np
 
     dt = TimeDelta((1 / 144) * u.day, format="jd")  # 10 minutes in Julian days
     n_steps = int((tstop - tstart) / dt)  # Number of time steps
