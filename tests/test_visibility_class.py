@@ -169,7 +169,6 @@ class TestVisibilityClassMethods:
 
     def test_summary_array_time_raises_error(self, visibility_instance, target_coord):
         """Test that summary raises error with array time input."""
-        import numpy as np
 
         times = Time("2025-01-01T00:00:00") + np.arange(5) * u.hour
 
