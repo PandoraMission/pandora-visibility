@@ -8,7 +8,7 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
-numpy = "^1.23.2"
+numpy = ">=1.26"
 sgp4 = "^2.23"
 astropy = ">=6.1"
 pandas = "^2.2.3"
