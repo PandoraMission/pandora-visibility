@@ -57,7 +57,6 @@ def test_target():
     tstart = Time("2025-01-01T00:00:00.000")
     tstop = Time("2025-01-02T00:00:00.000")  # Example stop time
 
-    import numpy as np
     from astropy import units as u
 
     dt = TimeDelta((1 / 144) * u.day, format="jd")  # 10 minutes in Julian days
@@ -91,8 +90,6 @@ def test_custom_limits():
 
     tstart = Time("2025-01-01T00:00:00.000")
     tstop = Time("2025-01-02T00:00:00.000")  # Example stop time
-
-    import numpy as np
 
     dt = TimeDelta((1 / 144) * u.day, format="jd")  # 10 minutes in Julian days
     n_steps = int((tstop - tstart) / dt)  # Number of time steps
