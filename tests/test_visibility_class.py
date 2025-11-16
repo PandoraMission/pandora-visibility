@@ -265,7 +265,6 @@ class TestVisibilityClassMethods:
 
     def test_get_state_with_array_time(self, visibility_instance):
         """Test get_state with array of times."""
-        import numpy as np
 
         times = Time("2025-01-01T00:00:00") + np.arange(5) * u.hour
         states = visibility_instance.get_state(times)
