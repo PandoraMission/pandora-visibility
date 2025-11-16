@@ -8,7 +8,7 @@ def test_numpy_compatibility():
     numpy_version = version.parse(np.__version__)
     min_version = version.parse("1.26.0")
     assert numpy_version >= min_version, \
-        f"NumPy version {np.__version__} is less than 1.26.0"
+        f"NumPy version {np.__version__} is less than {min_version}"
 
     # Verify numpy can be imported and basic operations work
     test_array = np.array([1, 2, 3])
