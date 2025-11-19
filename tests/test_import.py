@@ -1,14 +1,16 @@
-from pandoravisibility import Visibility
 import numpy as np
 from packaging import version
+
+from pandoravisibility import Visibility
 
 
 def test_numpy_compatibility():
     """Test that numpy version is >= 1.26 and imports work correctly."""
     numpy_version = version.parse(np.__version__)
     min_version = version.parse("1.26.0")
-    assert numpy_version >= min_version, \
-        f"NumPy version {np.__version__} is less than {min_version}"
+    assert (
+        numpy_version >= min_version
+    ), f"NumPy version {np.__version__} is less than {min_version}"
 
     # Verify numpy can be imported and basic operations work
     test_array = np.array([1, 2, 3])
@@ -38,8 +40,8 @@ def test_visibility():
     # test satnum
     assert int(vis.tle.satnum) == 99152
 
-    from astropy.constants import R_earth
     from astropy import units as u
+    from astropy.constants import R_earth
 
     assert (vis.tle.a * u.earthRad - R_earth).to(u.km).value > 596
     assert (vis.tle.a * u.earthRad - R_earth).to(u.km).value < 597
@@ -61,7 +63,7 @@ def test_target():
 
     dt = TimeDelta((1 / 144) * u.day, format="jd")  # 10 minutes in Julian days
     n_steps = int((tstop - tstart) / dt)  # Number of time steps
-    time_deltas = TimeDelta(np.arange(n_steps) * dt.jd, format='jd')
+    time_deltas = TimeDelta(np.arange(n_steps) * dt.jd, format="jd")
     times = tstart + time_deltas
 
     # using Capella because it is visible in the time period
@@ -82,8 +84,13 @@ def test_custom_limits():
     from astropy import units as u
 
     vis = Visibility(
-        line1, line2, moon_min=20 * u.deg, earthlimb_min=10 * u.deg, sun_min=90 * u.deg,
-        jupiter_min=0 * u.deg, mars_min=0 * u.deg
+        line1,
+        line2,
+        moon_min=20 * u.deg,
+        earthlimb_min=10 * u.deg,
+        sun_min=90 * u.deg,
+        jupiter_min=0 * u.deg,
+        mars_min=0 * u.deg,
     )
 
     from astropy.time import Time, TimeDelta
@@ -93,7 +100,7 @@ def test_custom_limits():
 
     dt = TimeDelta((1 / 144) * u.day, format="jd")  # 10 minutes in Julian days
     n_steps = int((tstop - tstart) / dt)  # Number of time steps
-    time_deltas = TimeDelta(np.arange(n_steps) * dt.jd, format='jd')
+    time_deltas = TimeDelta(np.arange(n_steps) * dt.jd, format="jd")
     times = tstart + time_deltas
 
     # using Capella because it is visible in the time period
@@ -108,25 +115,26 @@ def test_custom_limits():
 
 def test_edge_cases():
     """Test edge cases and boundary conditions."""
-    from astropy.time import Time
-    from astropy.coordinates import SkyCoord
     from astropy import units as u
-    
+    from astropy.coordinates import SkyCoord
+    from astropy.time import Time
+
     line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
     line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
-    
-    vis = Visibility(line1, line2)
+
+    _ = Visibility(line1, line2)
     target_coord = SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
     time = Time("2025-01-01T00:00:00")
-    
+
     # Test with zero constraints
-    vis_zero = Visibility(line1, line2, moon_min=0*u.deg, sun_min=0*u.deg, 
-                         earthlimb_min=-90*u.deg)
+    vis_zero = Visibility(
+        line1, line2, moon_min=0 * u.deg, sun_min=0 * u.deg, earthlimb_min=-90 * u.deg
+    )
     result = vis_zero.get_visibility(target_coord, time)
     assert isinstance(result, bool)
-    assert result == True
-    
+    assert result is True
+
     # Test with very high constraints (should always fail)
-    vis_high = Visibility(line1, line2, moon_min=180*u.deg)
+    vis_high = Visibility(line1, line2, moon_min=180 * u.deg)
     result = vis_high.get_visibility(target_coord, time)
-    assert result == False
+    assert result is False

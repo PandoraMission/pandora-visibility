@@ -2,12 +2,13 @@
 Tests for Visibility class methods that are not covered in test_import.py
 """
 
-import pytest
 import numpy as np
-from pandoravisibility import Visibility
-from astropy.time import Time
-from astropy.coordinates import SkyCoord
+import pytest
 from astropy import units as u
+from astropy.coordinates import SkyCoord
+from astropy.time import Time
+
+from pandoravisibility import Visibility
 
 
 class TestVisibilityClassMethods:

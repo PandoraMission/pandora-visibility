@@ -2,22 +2,23 @@
 Tests for utils module functions
 """
 
-import pytest
-import numpy as np
-from astropy.time import Time
-from astropy.coordinates import SkyCoord
-from astropy import units as u
-import pandas as pd
 import os
 import tempfile
 
+import numpy as np
+import pandas as pd
+import pytest
+from astropy import units as u
+from astropy.coordinates import SkyCoord
+from astropy.time import Time
+
 from pandoravisibility.utils import (
-    analyze_yearly_visibility,
-    find_continuous_periods,
-    calculate_visibility_statistics,
-    find_optimal_observation_windows,
-    export_visibility_periods,
     analyze_target_yearly_visibility,
+    analyze_yearly_visibility,
+    calculate_visibility_statistics,
+    export_visibility_periods,
+    find_continuous_periods,
+    find_optimal_observation_windows,
     get_visibility_summary,
 )
 
