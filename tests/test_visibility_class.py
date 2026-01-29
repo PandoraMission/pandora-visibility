@@ -272,3 +272,150 @@ class TestVisibilityClassMethods:
 
         assert len(states) == 5
         assert isinstance(states, SkyCoord)
+
+    def test_get_star_tracker_angles_return_structure(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test that get_star_tracker_angles returns dict with correct keys."""
+        result = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=1
+        )
+
+        assert isinstance(result, dict)
+        assert "ra" in result
+        assert "dec" in result
+        assert "sun_angle" in result
+        assert "earth_angle" in result
+        assert "earthlimb_angle" in result
+
+        # Check all values are Quantities with degree units
+        for key, value in result.items():
+            assert hasattr(value, "unit")
+            assert value.unit.is_equivalent(u.deg)
+
+    def test_get_star_tracker_angles_tracker1(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test star tracker 1 RA/Dec calculation."""
+        result = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=1
+        )
+
+        # RA should be in [0, 360) degrees
+        assert 0 * u.deg <= result["ra"] < 360 * u.deg
+        # Dec should be in [-90, 90] degrees
+        assert -90 * u.deg <= result["dec"] <= 90 * u.deg
+
+    def test_get_star_tracker_angles_tracker2(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test star tracker 2 RA/Dec calculation."""
+        result = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=2
+        )
+
+        # RA should be in [0, 360) degrees
+        assert 0 * u.deg <= result["ra"] < 360 * u.deg
+        # Dec should be in [-90, 90] degrees
+        assert -90 * u.deg <= result["dec"] <= 90 * u.deg
+
+    def test_get_star_tracker_angles_different_trackers(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test that tracker 1 and tracker 2 give different RA/Dec."""
+        result1 = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=1
+        )
+        result2 = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=2
+        )
+
+        # The two trackers should point at different sky positions
+        # (unless in a very special geometry)
+        ra_diff = abs(result1["ra"] - result2["ra"])
+        dec_diff = abs(result1["dec"] - result2["dec"])
+
+        # At least one coordinate should be different by > 0.1 degrees
+        assert ra_diff > 0.1 * u.deg or dec_diff > 0.1 * u.deg
+
+    def test_get_star_tracker_angles_sun_angle(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test sun angle calculation is reasonable."""
+        result = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=1
+        )
+
+        # Sun angle should be between 0 and 180 degrees
+        assert 0 * u.deg <= result["sun_angle"] <= 180 * u.deg
+
+    def test_get_star_tracker_angles_earth_angle(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test earth angle calculation is reasonable."""
+        result = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=1
+        )
+
+        # Earth angle should be between 0 and 180 degrees
+        assert 0 * u.deg <= result["earth_angle"] <= 180 * u.deg
+
+    def test_get_star_tracker_angles_earthlimb_angle(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test earthlimb angle calculation is reasonable."""
+        result = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=1
+        )
+
+        # Earthlimb angle should be between -90 and 180 degrees
+        # (can be negative if below horizon)
+        assert -90 * u.deg <= result["earthlimb_angle"] <= 180 * u.deg
+
+    def test_get_star_tracker_angles_invalid_tracker_number(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test that invalid tracker number raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid tracker number"):
+            visibility_instance.get_star_tracker_angles(
+                target_coord, test_time, tracker=3
+            )
+
+        with pytest.raises(ValueError, match="Invalid tracker number"):
+            visibility_instance.get_star_tracker_angles(
+                target_coord, test_time, tracker=0
+            )
+
+    def test_get_star_tracker_angles_sun_aligned_target(self, visibility_instance):
+        """Test that target aligned with sun raises ValueError."""
+        # Use a time and find the sun's position
+        test_time = Time("2025-06-21T12:00:00")
+
+        # Get the sun's position at this time
+        from astropy.coordinates import get_body
+
+        observer_location = visibility_instance._get_observer_location(test_time)
+        sun_coord = get_body("sun", time=test_time, location=observer_location)
+
+        # Use sun's position as target (aligned with sun)
+        with pytest.raises(
+            ValueError, match="Cannot determine attitude: target is aligned with the sun"
+        ):
+            visibility_instance.get_star_tracker_angles(
+                sun_coord, test_time, tracker=1
+            )
+
+    def test_get_star_tracker_angles_default_tracker(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test that default tracker parameter is 1."""
+        result_default = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time
+        )
+        result_tracker1 = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=1
+        )
+
+        # Default should be same as tracker=1
+        assert result_default["ra"] == result_tracker1["ra"]
+        assert result_default["dec"] == result_tracker1["dec"]
