@@ -403,7 +403,7 @@ class Visibility:
         
         # Create SkyCoord for Earth center direction
         earth_coord = SkyCoord(
-            x=earth_eci[0], y=earth_eci[1], z=earth_eci[2],
+            x=earth_eci.value[0], y=earth_eci.value[1], z=earth_eci.value[2],
             representation_type='cartesian', frame='gcrs'
         )
         
