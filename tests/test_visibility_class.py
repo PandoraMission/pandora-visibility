@@ -5,7 +5,7 @@ Tests for Visibility class methods that are not covered in test_import.py
 import numpy as np
 import pytest
 from astropy import units as u
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import SkyCoord, get_body
 from astropy.time import Time
 
 from pandoravisibility import Visibility
@@ -331,12 +331,16 @@ class TestVisibilityClassMethods:
         )
 
         # The two trackers should point at different sky positions
-        # (unless in a very special geometry)
+        # Tracker 1 and 2 have opposite Y-components in their boresight vectors
+        # (0.7071 vs -0.7071), which should produce different pointings
         ra_diff = abs(result1["ra"] - result2["ra"])
+        # Handle RA wrapping at 0/360 degrees
+        ra_diff = min(ra_diff, 360 * u.deg - ra_diff)
         dec_diff = abs(result1["dec"] - result2["dec"])
 
-        # At least one coordinate should be different by > 0.1 degrees
-        assert ra_diff > 0.1 * u.deg or dec_diff > 0.1 * u.deg
+        # At least one coordinate should be different by > 1 degree
+        # This threshold accounts for the geometric difference in tracker orientations
+        assert ra_diff > 1.0 * u.deg or dec_diff > 1.0 * u.deg
 
     def test_get_star_tracker_angles_sun_angle(
         self, visibility_instance, target_coord, test_time
@@ -392,8 +396,6 @@ class TestVisibilityClassMethods:
         test_time = Time("2025-06-21T12:00:00")
 
         # Get the sun's position at this time
-        from astropy.coordinates import get_body
-
         observer_location = visibility_instance._get_observer_location(test_time)
         sun_coord = get_body("sun", time=test_time, location=observer_location)
 
@@ -416,6 +418,9 @@ class TestVisibilityClassMethods:
             target_coord, test_time, tracker=1
         )
 
-        # Default should be same as tracker=1
+        # Default should be same as tracker=1 for all values
         assert result_default["ra"] == result_tracker1["ra"]
         assert result_default["dec"] == result_tracker1["dec"]
+        assert result_default["sun_angle"] == result_tracker1["sun_angle"]
+        assert result_default["earth_angle"] == result_tracker1["earth_angle"]
+        assert result_default["earthlimb_angle"] == result_tracker1["earthlimb_angle"]
