@@ -294,6 +294,135 @@ class Visibility:
             limb_angle = np.arccos(R_earth / observer_distance)
 
         return alt + limb_angle
+    
+    @staticmethod
+    def _get_star_tracker_body_xyz(tracker: int) -> tuple:
+        """
+        Get the star tracker boresight direction in body frame coordinates.
+        
+        Parameters:
+        tracker : int
+            Star tracker number (1 or 2)
+            
+        Returns:
+        tuple
+            (x, y, z) unit vector in body frame
+        """
+        if tracker == 1:
+            vec = np.array([0.6804, -0.7071, -0.1923], dtype=float)
+        elif tracker == 2:
+            vec = np.array([0.6804, 0.7071, -0.1923], dtype=float)
+        else:
+            raise ValueError(f"Invalid tracker number: {tracker}. Must be 1 or 2.")
+
+        norm = np.linalg.norm(vec)
+        if norm == 0.0:
+            raise ValueError("Star tracker boresight vector has zero magnitude.")
+
+        vec_unit = vec / norm
+        return tuple(vec_unit.tolist())
+    def get_star_tracker_angles(
+        self, target_coord: SkyCoord, time: Time, tracker: int = 1
+    ) -> dict:
+        """
+        Calculate the star tracker sun and Earth angles.
+        
+        The payload +Z points at the science target.
+        The payload +Y is the cross product of +Z and the sun vector.
+        The payload +X completes the right-handed coordinate system.
+        
+        Parameters:
+        target_coord : SkyCoord
+            The science target coordinate (+Z direction)
+        time : Time
+            The observation time
+        tracker : int
+            Star tracker number (1 or 2)
+            
+        Returns:
+        dict
+            Dictionary with 'ra', 'dec', 'sun_angle', 'earth_angle', and 
+            'earthlimb_angle' as Quantities in degrees
+            
+        Raises:
+        ValueError
+            If target is too close to the sun (degenerate attitude)
+        """
+        observer_location = self._get_observer_location(time)
+        
+        # Get target direction unit vector in ECI (GCRS)
+        target_gcrs = target_coord.transform_to('gcrs')
+        target_eci = target_gcrs.cartesian.xyz
+        target_eci = target_eci / np.linalg.norm(target_eci)
+        z_payload = target_eci.value  # payload +Z points at target
+        
+        # Get sun direction unit vector in ECI
+        sun_coord = get_body("sun", time=time, location=observer_location)
+        sun_gcrs = sun_coord.transform_to('gcrs')
+        sun_eci = sun_gcrs.cartesian.xyz
+        sun_eci = sun_eci / np.linalg.norm(sun_eci)
+        sun_vec = sun_eci.value
+        
+        # Calculate payload coordinate system
+        # +Y = +Z x sun_vector (normalized)
+        y_payload = np.cross(z_payload, sun_vec)
+        y_norm = np.linalg.norm(y_payload)
+        
+        # Check for degenerate case (target aligned with sun)
+        if y_norm < 1e-10:
+            raise ValueError(
+                "Cannot determine attitude: target is aligned with the sun"
+            )
+        y_payload = y_payload / y_norm
+        
+        # +X = +Y x +Z (completes right-handed system)
+        x_payload = np.cross(y_payload, z_payload)
+        x_payload = x_payload / np.linalg.norm(x_payload)
+        
+        # Get star tracker boresight in body frame
+        st_body = np.array(self._get_star_tracker_body_xyz(tracker))
+        
+        # Transform star tracker boresight to ECI frame
+        # Rotation matrix: columns are payload axes in ECI frame
+        R = np.column_stack([x_payload, y_payload, z_payload])
+        st_eci = R @ st_body
+        st_eci = st_eci / np.linalg.norm(st_eci)
+        
+        # Create SkyCoord for star tracker boresight in ECI
+        st_coord = SkyCoord(
+            x=st_eci[0], y=st_eci[1], z=st_eci[2],
+            representation_type='cartesian', frame='gcrs'
+        )
+        
+        # Calculate sun angle (separation between star tracker and sun)
+        sun_angle = st_coord.separation(sun_gcrs)
+        
+        # Get observer position in ECI and calculate nadir (Earth center direction)
+        obs_gcrs = observer_location.get_gcrs(obstime=time)
+        obs_eci = obs_gcrs.cartesian.xyz
+        earth_eci = -obs_eci / np.linalg.norm(obs_eci)  # nadir direction
+        
+        # Create SkyCoord for Earth center direction
+        earth_coord = SkyCoord(
+            x=earth_eci.value[0], y=earth_eci.value[1], z=earth_eci.value[2],
+            representation_type='cartesian', frame='gcrs'
+        )
+        
+        # Calculate Earth center angle
+        earth_angle = st_coord.separation(earth_coord)
+        
+        # Calculate Earth limb angle using existing method
+        earthlimb_angle = self._get_angle_from_earth_limb(
+            observer_location, st_coord, time
+        )
+        
+        return {
+            'ra': st_coord.spherical.lon.to(u.deg),
+            'dec': st_coord.spherical.lat.to(u.deg),
+            'sun_angle': sun_angle.to(u.deg),
+            'earth_angle': earth_angle.to(u.deg),
+            'earthlimb_angle': earthlimb_angle.to(u.deg)
+        }
 
     def get_all_constraints(self, target_coord: SkyCoord, time: Time) -> dict:
         """Get status of all active constraints."""
