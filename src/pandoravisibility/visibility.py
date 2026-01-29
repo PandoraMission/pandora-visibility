@@ -301,12 +301,10 @@ class Visibility:
         Get the star tracker boresight direction in body frame coordinates.
         
         Parameters:
-        -----------
         tracker : int
             Star tracker number (1 or 2)
             
         Returns:
-        --------
         tuple
             (x, y, z) unit vector in body frame
         """
@@ -328,7 +326,6 @@ class Visibility:
         The payload +X completes the right-handed coordinate system.
         
         Parameters:
-        -----------
         target_coord : SkyCoord
             The science target coordinate (+Z direction)
         time : Time
@@ -337,13 +334,11 @@ class Visibility:
             Star tracker number (1 or 2)
             
         Returns:
-        --------
         dict
             Dictionary with 'ra', 'dec', 'sun_angle', 'earth_angle', and 
             'earthlimb_angle' as Quantities in degrees
             
         Raises:
-        -------
         ValueError
             If target is too close to the sun (degenerate attitude)
         """
