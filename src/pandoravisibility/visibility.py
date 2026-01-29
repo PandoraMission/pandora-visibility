@@ -311,12 +311,18 @@ class Visibility:
             (x, y, z) unit vector in body frame
         """
         if tracker == 1:
-            return (0.6804, -0.7071, -0.1923)
+            vec = np.array([0.6804, -0.7071, -0.1923], dtype=float)
         elif tracker == 2:
-            return (0.6804, 0.7071, -0.1923)
+            vec = np.array([0.6804, 0.7071, -0.1923], dtype=float)
         else:
             raise ValueError(f"Invalid tracker number: {tracker}. Must be 1 or 2.")
 
+        norm = np.linalg.norm(vec)
+        if norm == 0.0:
+            raise ValueError("Star tracker boresight vector has zero magnitude.")
+
+        vec_unit = vec / norm
+        return tuple(vec_unit.tolist())
     def get_star_tracker_angles(
         self, target_coord: SkyCoord, time: Time, tracker: int = 1
     ) -> dict:
