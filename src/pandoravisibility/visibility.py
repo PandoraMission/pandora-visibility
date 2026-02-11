@@ -352,22 +352,26 @@ class Visibility:
         Get the star tracker boresight direction in body frame coordinates.
         
         Parameters:
-        -----------
         tracker : int
             Star tracker number (1 or 2)
             
         Returns:
-        --------
         tuple
             (x, y, z) unit vector in body frame
         """
         if tracker == 1:
-            return (0.6804, -0.7071, -0.1923)
+            vec = np.array([0.6804, -0.7071, -0.1923], dtype=float)
         elif tracker == 2:
-            return (0.6804, 0.7071, -0.1923)
+            vec = np.array([0.6804, 0.7071, -0.1923], dtype=float)
         else:
             raise ValueError(f"Invalid tracker number: {tracker}. Must be 1 or 2.")
 
+        norm = np.linalg.norm(vec)
+        if norm == 0.0:
+            raise ValueError("Star tracker boresight vector has zero magnitude.")
+
+        vec_unit = vec / norm
+        return tuple(vec_unit.tolist())
     def get_star_tracker_angles(
         self, target_coord: SkyCoord, time: Time, tracker: int = 1
     ) -> dict:
@@ -379,7 +383,6 @@ class Visibility:
         The payload +X completes the right-handed coordinate system.
         
         Parameters:
-        -----------
         target_coord : SkyCoord
             The science target coordinate (+Z direction)
         time : Time
@@ -388,14 +391,12 @@ class Visibility:
             Star tracker number (1 or 2)
             
         Returns:
-        --------
         dict
             Dictionary with 'ra', 'dec', 'sun_angle', 'moon_angle',
             'earth_angle', and 'earthlimb_angle' as Quantities in degrees.
             Values are scalar or array depending on time input.
             
         Raises:
-        -------
         ValueError
             If target is too close to the sun (degenerate attitude)
         """
@@ -421,7 +422,7 @@ class Visibility:
         else:
             earth_eci = -obs_eci / np.linalg.norm(obs_eci, axis=0, keepdims=True)
         earth_coord = SkyCoord(
-            x=earth_eci[0], y=earth_eci[1], z=earth_eci[2],
+            x=earth_eci.value[0], y=earth_eci.value[1], z=earth_eci.value[2],
             representation_type='cartesian', frame='gcrs'
         )
         earth_angle = st_coord.separation(earth_coord)
