@@ -403,9 +403,7 @@ class TestVisibilityClassMethods:
         with pytest.raises(
             ValueError, match="Cannot determine attitude: target aligned with sun"
         ):
-            visibility_instance.get_star_tracker_angles(
-                sun_coord, test_time, tracker=1
-            )
+            visibility_instance.get_star_tracker_angles(sun_coord, test_time, tracker=1)
 
     def test_get_star_tracker_angles_default_tracker(
         self, visibility_instance, target_coord, test_time
@@ -455,7 +453,8 @@ class TestStarTrackerConstraints:
     def test_st_custom_limits_applied(self, line1, line2):
         """Custom star tracker limits are stored on the instance."""
         vis = Visibility(
-            line1, line2,
+            line1,
+            line2,
             st_sun_min=45 * u.deg,
             st_moon_min=10 * u.deg,
             st_earthlimb_min=20 * u.deg,
@@ -486,9 +485,7 @@ class TestStarTrackerConstraints:
         result = vis.get_star_tracker_constraint(target_coord, test_time)
         assert result is True
 
-    def test_constraint_passes_when_disabled_array(
-        self, line1, line2, target_coord
-    ):
+    def test_constraint_passes_when_disabled_array(self, line1, line2, target_coord):
         """Disabled ST constraints return all-True array for array times."""
         vis = Visibility(line1, line2)
         times = Time("2025-01-01T00:00:00") + np.arange(3) * u.hour
@@ -542,14 +539,20 @@ class TestStarTrackerConstraints:
         self, line1, line2, target_coord, test_time
     ):
         """ST constraint should affect get_visibility result."""
-        vis_loose = Visibility(line1, line2, st_sun_min=1 * u.deg)
+        # Build two instances that differ ONLY in ST sun limit
+        vis_none = Visibility(line1, line2)
         vis_tight = Visibility(line1, line2, st_sun_min=180 * u.deg)
 
-        result_loose = vis_loose.get_visibility(target_coord, test_time)
+        result_none = vis_none.get_visibility(target_coord, test_time)
         result_tight = vis_tight.get_visibility(target_coord, test_time)
 
-        # Tight ST sun constraint should block visibility
-        assert result_tight is False
+        # Without any ST constraint, baseline visibility is whatever it is
+        # With an impossible 180° ST sun limit, visibility must be strictly worse
+        if result_none:
+            assert result_tight is False
+        else:
+            # Even if baseline is False (other constraints), tight ST can't help
+            assert result_tight is False
 
     def test_get_all_constraints_includes_star_tracker(
         self, line1, line2, target_coord, test_time
@@ -610,9 +613,7 @@ class TestStarTrackerConstraints:
         self, line1, line2, target_coord, test_time
     ):
         """st_required=0 means ST constraints are inactive even with limits set."""
-        vis = Visibility(
-            line1, line2, st_sun_min=180 * u.deg, st_required=0
-        )
+        vis = Visibility(line1, line2, st_sun_min=180 * u.deg, st_required=0)
         # Should always pass since st_required=0 disables ST checks
         result = vis.get_star_tracker_constraint(target_coord, test_time)
         assert result is True
@@ -621,20 +622,14 @@ class TestStarTrackerConstraints:
         self, line1, line2, target_coord, test_time
     ):
         """st_required=0 means star_tracker key is absent from get_all_constraints."""
-        vis = Visibility(
-            line1, line2, st_sun_min=45 * u.deg, st_required=0
-        )
+        vis = Visibility(line1, line2, st_sun_min=45 * u.deg, st_required=0)
         constraints = vis.get_all_constraints(target_coord, test_time)
         assert "star_tracker" not in constraints
 
-    def test_st_required_two_requires_both(
-        self, line1, line2, target_coord, test_time
-    ):
+    def test_st_required_two_requires_both(self, line1, line2, target_coord, test_time):
         """st_required=2 means both trackers must pass."""
         # With a small limit both should pass for a reasonable target
-        vis = Visibility(
-            line1, line2, st_sun_min=1 * u.deg, st_required=2
-        )
+        vis = Visibility(line1, line2, st_sun_min=1 * u.deg, st_required=2)
         result = vis.get_star_tracker_constraint(target_coord, test_time)
         assert result  # Both should pass with a tiny limit
 
@@ -649,12 +644,8 @@ class TestStarTrackerConstraints:
         repr_str = repr(vis)
         assert "st_req=2" in repr_str
 
-    def test_summary_shows_both_label(
-        self, line1, line2, target_coord, test_time
-    ):
+    def test_summary_shows_both_label(self, line1, line2, target_coord, test_time):
         """Summary shows 'both' when st_required=2."""
-        vis = Visibility(
-            line1, line2, st_sun_min=1 * u.deg, st_required=2
-        )
+        vis = Visibility(line1, line2, st_sun_min=1 * u.deg, st_required=2)
         summary = vis.summary(target_coord, test_time)
         assert "both" in summary

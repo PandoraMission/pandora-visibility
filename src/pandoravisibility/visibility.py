@@ -96,9 +96,7 @@ class Visibility:
         )
         self.st_required = custom_limits.get("st_required", self.ST_REQUIRED)
         if self.st_required not in (0, 1, 2):
-            raise ValueError(
-                f"st_required must be 0, 1, or 2, got {self.st_required}"
-            )
+            raise ValueError(f"st_required must be 0, 1, or 2, got {self.st_required}")
 
     def __repr__(self) -> str:
         """Return a string representation of the TLE object for debugging."""
@@ -350,11 +348,11 @@ class Visibility:
     def _get_star_tracker_body_xyz(tracker: int) -> tuple:
         """
         Get the star tracker boresight direction in body frame coordinates.
-        
+
         Parameters:
         tracker : int
             Star tracker number (1 or 2)
-            
+
         Returns:
         tuple
             (x, y, z) unit vector in body frame
@@ -372,16 +370,17 @@ class Visibility:
 
         vec_unit = vec / norm
         return tuple(vec_unit.tolist())
+
     def get_star_tracker_angles(
         self, target_coord: SkyCoord, time: Time, tracker: int = 1
     ) -> dict:
         """
         Calculate the star tracker sun and Earth angles.
-        
+
         The payload +Z points at the science target.
         The payload +Y is the cross product of +Z and the sun vector.
         The payload +X completes the right-handed coordinate system.
-        
+
         Parameters:
         target_coord : SkyCoord
             The science target coordinate (+Z direction)
@@ -389,13 +388,13 @@ class Visibility:
             The observation time (scalar or array)
         tracker : int
             Star tracker number (1 or 2)
-            
+
         Returns:
         dict
             Dictionary with 'ra', 'dec', 'sun_angle', 'moon_angle',
             'earth_angle', and 'earthlimb_angle' as Quantities in degrees.
             Values are scalar or array depending on time input.
-            
+
         Raises:
         ValueError
             If target is too close to the sun (degenerate attitude)
@@ -407,12 +406,13 @@ class Visibility:
 
         # Sun angle
         sun_coord = get_body("sun", time=time, location=observer_location)
-        sun_gcrs = sun_coord.transform_to('gcrs')
+        sun_gcrs = sun_coord.transform_to("gcrs")
         sun_angle = st_coord.separation(sun_gcrs)
 
         # Moon angle
         moon_coord = get_body("moon", time=time, location=observer_location)
-        moon_angle = st_coord.separation(moon_coord, origin_mismatch="ignore")
+        moon_gcrs = moon_coord.transform_to("gcrs")
+        moon_angle = st_coord.separation(moon_gcrs)
 
         # Earth center angle (nadir direction)
         obs_gcrs = observer_location.get_gcrs(obstime=time)
@@ -422,8 +422,11 @@ class Visibility:
         else:
             earth_eci = -obs_eci / np.linalg.norm(obs_eci, axis=0, keepdims=True)
         earth_coord = SkyCoord(
-            x=earth_eci.value[0], y=earth_eci.value[1], z=earth_eci.value[2],
-            representation_type='cartesian', frame='gcrs'
+            x=earth_eci.value[0],
+            y=earth_eci.value[1],
+            z=earth_eci.value[2],
+            representation_type="cartesian",
+            frame="gcrs",
         )
         earth_angle = st_coord.separation(earth_coord)
 
@@ -433,12 +436,12 @@ class Visibility:
         )
 
         return {
-            'ra': st_coord.spherical.lon.to(u.deg),
-            'dec': st_coord.spherical.lat.to(u.deg),
-            'sun_angle': sun_angle.to(u.deg),
-            'moon_angle': moon_angle.to(u.deg),
-            'earth_angle': earth_angle.to(u.deg),
-            'earthlimb_angle': earthlimb_angle.to(u.deg)
+            "ra": st_coord.spherical.lon.to(u.deg),
+            "dec": st_coord.spherical.lat.to(u.deg),
+            "sun_angle": sun_angle.to(u.deg),
+            "moon_angle": moon_angle.to(u.deg),
+            "earth_angle": earth_angle.to(u.deg),
+            "earthlimb_angle": earthlimb_angle.to(u.deg),
         }
 
     def _get_star_tracker_skycoord(
@@ -491,9 +494,7 @@ class Visibility:
             y_payload = np.cross(z_payload, sun_vec)
             y_norm = np.linalg.norm(y_payload)
             if y_norm < 1e-10:
-                raise ValueError(
-                    "Cannot determine attitude: target aligned with sun"
-                )
+                raise ValueError("Cannot determine attitude: target aligned with sun")
             y_payload = y_payload / y_norm
             x_payload = np.cross(y_payload, z_payload)
             x_payload = x_payload / np.linalg.norm(x_payload)
@@ -569,9 +570,7 @@ class Visibility:
 
         for tracker in [1, 2]:
             try:
-                angles = self.get_star_tracker_angles(
-                    target_coord, time, tracker
-                )
+                angles = self.get_star_tracker_angles(target_coord, time, tracker)
             except ValueError:
                 if time.isscalar:
                     tracker_results.append(False)
@@ -696,13 +695,13 @@ class Visibility:
         if self._st_constraint_active:
             lines.append("-" * 60)
             req_label = "both" if self.st_required == 2 else "≥1"
-            lines.append(f"Star Tracker Constraints (need {req_label} tracker passing):")
+            lines.append(
+                f"Star Tracker Constraints (need {req_label} tracker passing):"
+            )
 
             for tracker in [1, 2]:
                 try:
-                    angles = self.get_star_tracker_angles(
-                        target_coord, time, tracker
-                    )
+                    angles = self.get_star_tracker_angles(target_coord, time, tracker)
                     tracker_pass = True
                     details = []
                     for name, limit, key in self._st_checks:
