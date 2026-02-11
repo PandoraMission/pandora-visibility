@@ -272,3 +272,237 @@ class TestVisibilityClassMethods:
 
         assert len(states) == 5
         assert isinstance(states, SkyCoord)
+
+
+class TestStarTrackerConstraints:
+    """Test suite for star tracker keep-out constraint features."""
+
+    @pytest.fixture
+    def line1(self):
+        return "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
+
+    @pytest.fixture
+    def line2(self):
+        return "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+
+    @pytest.fixture
+    def target_coord(self):
+        return SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
+
+    @pytest.fixture
+    def test_time(self):
+        return Time("2025-01-01T00:00:00")
+
+    def test_st_defaults_are_zero(self, line1, line2):
+        """Star tracker constraints default to 0 (disabled)."""
+        vis = Visibility(line1, line2)
+        assert vis.st_sun_min == 0 * u.deg
+        assert vis.st_moon_min == 0 * u.deg
+        assert vis.st_earthlimb_min == 0 * u.deg
+
+    def test_st_custom_limits_applied(self, line1, line2):
+        """Custom star tracker limits are stored on the instance."""
+        vis = Visibility(
+            line1, line2,
+            st_sun_min=45 * u.deg,
+            st_moon_min=10 * u.deg,
+            st_earthlimb_min=20 * u.deg,
+        )
+        assert vis.st_sun_min == 45 * u.deg
+        assert vis.st_moon_min == 10 * u.deg
+        assert vis.st_earthlimb_min == 20 * u.deg
+
+    def test_repr_shows_st_constraints(self, line1, line2):
+        """__repr__ includes star tracker constraints when non-zero."""
+        vis = Visibility(line1, line2, st_sun_min=45 * u.deg)
+        repr_str = repr(vis)
+        assert "st_sun≥45 deg" in repr_str
+
+    def test_repr_hides_st_when_zero(self, line1, line2):
+        """__repr__ does not mention star tracker when all ST limits are 0."""
+        vis = Visibility(line1, line2)
+        repr_str = repr(vis)
+        assert "st_sun" not in repr_str
+        assert "st_moon" not in repr_str
+        assert "st_limb" not in repr_str
+
+    def test_constraint_passes_when_disabled(
+        self, line1, line2, target_coord, test_time
+    ):
+        """With all ST limits at 0, get_star_tracker_constraint always returns True."""
+        vis = Visibility(line1, line2)
+        result = vis.get_star_tracker_constraint(target_coord, test_time)
+        assert result is True
+
+    def test_constraint_passes_when_disabled_array(
+        self, line1, line2, target_coord
+    ):
+        """Disabled ST constraints return all-True array for array times."""
+        vis = Visibility(line1, line2)
+        times = Time("2025-01-01T00:00:00") + np.arange(3) * u.hour
+        result = vis.get_star_tracker_constraint(target_coord, times)
+        assert np.all(result)
+        assert result.shape == times.shape
+
+    def test_get_star_tracker_skycoord_returns_skycoord(
+        self, line1, line2, target_coord, test_time
+    ):
+        """_get_star_tracker_skycoord returns a SkyCoord in GCRS."""
+        vis = Visibility(line1, line2)
+        sc = vis._get_star_tracker_skycoord(target_coord, test_time, tracker=1)
+        assert isinstance(sc, SkyCoord)
+
+    def test_get_star_tracker_skycoord_two_trackers_differ(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Star tracker 1 and 2 point in different directions."""
+        vis = Visibility(line1, line2)
+        sc1 = vis._get_star_tracker_skycoord(target_coord, test_time, tracker=1)
+        sc2 = vis._get_star_tracker_skycoord(target_coord, test_time, tracker=2)
+        sep = sc1.separation(sc2)
+        assert sep.deg > 0  # They should not be identical
+
+    def test_get_star_tracker_skycoord_invalid_tracker(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Invalid tracker number raises ValueError."""
+        vis = Visibility(line1, line2)
+        with pytest.raises(ValueError, match="Invalid tracker"):
+            vis._get_star_tracker_skycoord(target_coord, test_time, tracker=3)
+
+    def test_constraint_with_very_large_sun_limit(
+        self, line1, line2, target_coord, test_time
+    ):
+        """A 180° ST sun limit should fail (impossible to satisfy)."""
+        vis = Visibility(line1, line2, st_sun_min=180 * u.deg)
+        result = vis.get_star_tracker_constraint(target_coord, test_time)
+        assert result is False or result == False  # noqa: E712
+
+    def test_constraint_with_small_sun_limit(
+        self, line1, line2, target_coord, test_time
+    ):
+        """A very small ST sun limit should pass for most targets."""
+        vis = Visibility(line1, line2, st_sun_min=1 * u.deg)
+        result = vis.get_star_tracker_constraint(target_coord, test_time)
+        assert result  # Capella is far from the sun, both trackers should be fine
+
+    def test_constraint_integrated_into_visibility(
+        self, line1, line2, target_coord, test_time
+    ):
+        """ST constraint should affect get_visibility result."""
+        vis_loose = Visibility(line1, line2, st_sun_min=1 * u.deg)
+        vis_tight = Visibility(line1, line2, st_sun_min=180 * u.deg)
+
+        result_loose = vis_loose.get_visibility(target_coord, test_time)
+        result_tight = vis_tight.get_visibility(target_coord, test_time)
+
+        # Tight ST sun constraint should block visibility
+        assert result_tight is False
+
+    def test_get_all_constraints_includes_star_tracker(
+        self, line1, line2, target_coord, test_time
+    ):
+        """get_all_constraints includes star_tracker key when active."""
+        vis = Visibility(line1, line2, st_sun_min=45 * u.deg)
+        constraints = vis.get_all_constraints(target_coord, test_time)
+        assert "star_tracker" in constraints
+
+    def test_get_all_constraints_excludes_star_tracker_when_disabled(
+        self, line1, line2, target_coord, test_time
+    ):
+        """get_all_constraints omits star_tracker key when all ST limits are 0."""
+        vis = Visibility(line1, line2)
+        constraints = vis.get_all_constraints(target_coord, test_time)
+        assert "star_tracker" not in constraints
+
+    def test_summary_includes_star_tracker_section(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Summary output includes star tracker section when ST constraints active."""
+        vis = Visibility(line1, line2, st_sun_min=45 * u.deg)
+        summary = vis.summary(target_coord, test_time)
+        assert "Star Tracker" in summary
+        assert "ST1" in summary
+        assert "ST2" in summary
+
+    def test_summary_omits_star_tracker_when_disabled(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Summary output has no star tracker section when all ST limits are 0."""
+        vis = Visibility(line1, line2)
+        summary = vis.summary(target_coord, test_time)
+        assert "Star Tracker" not in summary
+
+    def test_constraint_array_time(self, line1, line2, target_coord):
+        """ST constraint works with array times."""
+        vis = Visibility(line1, line2, st_sun_min=45 * u.deg)
+        times = Time("2025-01-01T00:00:00") + np.arange(3) * u.hour
+        result = vis.get_star_tracker_constraint(target_coord, times)
+        assert result.shape == times.shape
+        assert result.dtype == bool
+
+    def test_skycoord_array_time(self, line1, line2, target_coord):
+        """_get_star_tracker_skycoord works with array times."""
+        vis = Visibility(line1, line2)
+        times = Time("2025-01-01T00:00:00") + np.arange(3) * u.hour
+        sc = vis._get_star_tracker_skycoord(target_coord, times, tracker=1)
+        assert isinstance(sc, SkyCoord)
+        assert sc.shape == times.shape
+
+    def test_st_required_default_is_one(self, line1, line2):
+        """st_required defaults to 1."""
+        vis = Visibility(line1, line2)
+        assert vis.st_required == 1
+
+    def test_st_required_zero_disables_constraint(
+        self, line1, line2, target_coord, test_time
+    ):
+        """st_required=0 means ST constraints are inactive even with limits set."""
+        vis = Visibility(
+            line1, line2, st_sun_min=180 * u.deg, st_required=0
+        )
+        # Should always pass since st_required=0 disables ST checks
+        result = vis.get_star_tracker_constraint(target_coord, test_time)
+        assert result is True
+
+    def test_st_required_zero_excluded_from_all_constraints(
+        self, line1, line2, target_coord, test_time
+    ):
+        """st_required=0 means star_tracker key is absent from get_all_constraints."""
+        vis = Visibility(
+            line1, line2, st_sun_min=45 * u.deg, st_required=0
+        )
+        constraints = vis.get_all_constraints(target_coord, test_time)
+        assert "star_tracker" not in constraints
+
+    def test_st_required_two_requires_both(
+        self, line1, line2, target_coord, test_time
+    ):
+        """st_required=2 means both trackers must pass."""
+        # With a small limit both should pass for a reasonable target
+        vis = Visibility(
+            line1, line2, st_sun_min=1 * u.deg, st_required=2
+        )
+        result = vis.get_star_tracker_constraint(target_coord, test_time)
+        assert result  # Both should pass with a tiny limit
+
+    def test_st_required_invalid_raises(self, line1, line2):
+        """st_required must be 0, 1, or 2."""
+        with pytest.raises(ValueError, match="st_required must be 0, 1, or 2"):
+            Visibility(line1, line2, st_required=3)
+
+    def test_repr_shows_st_required(self, line1, line2):
+        """__repr__ includes st_req when ST constraints are active."""
+        vis = Visibility(line1, line2, st_sun_min=45 * u.deg, st_required=2)
+        repr_str = repr(vis)
+        assert "st_req=2" in repr_str
+
+    def test_summary_shows_both_label(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Summary shows 'both' when st_required=2."""
+        vis = Visibility(
+            line1, line2, st_sun_min=1 * u.deg, st_required=2
+        )
+        summary = vis.summary(target_coord, test_time)
+        assert "both" in summary

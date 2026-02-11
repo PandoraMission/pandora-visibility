@@ -54,6 +54,12 @@ class Visibility:
     MARS_MIN = 0 * u.deg
     JUPITER_MIN = 0 * u.deg
 
+    # Star tracker keep-out defaults (0 = disabled)
+    ST_SUN_MIN = 0 * u.deg
+    ST_MOON_MIN = 0 * u.deg
+    ST_EARTHLIMB_MIN = 0 * u.deg
+    ST_REQUIRED = 1  # Number of star trackers required to pass (0, 1, or 2)
+
     def __init__(self, line1: str, line2: str, **custom_limits):
         """
         Initialize the TLE object with the two lines of TLE data.
@@ -82,6 +88,18 @@ class Visibility:
         self.mars_min = custom_limits.get("mars_min", self.MARS_MIN)
         self.jupiter_min = custom_limits.get("jupiter_min", self.JUPITER_MIN)
 
+        # Star tracker limits
+        self.st_sun_min = custom_limits.get("st_sun_min", self.ST_SUN_MIN)
+        self.st_moon_min = custom_limits.get("st_moon_min", self.ST_MOON_MIN)
+        self.st_earthlimb_min = custom_limits.get(
+            "st_earthlimb_min", self.ST_EARTHLIMB_MIN
+        )
+        self.st_required = custom_limits.get("st_required", self.ST_REQUIRED)
+        if self.st_required not in (0, 1, 2):
+            raise ValueError(
+                f"st_required must be 0, 1, or 2, got {self.st_required}"
+            )
+
     def __repr__(self) -> str:
         """Return a string representation of the TLE object for debugging."""
         constraints = []
@@ -95,6 +113,14 @@ class Visibility:
             constraints.append(f"mars≥{self.mars_min:.0f}")
         if self.jupiter_min > 0 * u.deg:
             constraints.append(f"jupiter≥{self.jupiter_min:.0f}")
+        if self.st_sun_min > 0 * u.deg:
+            constraints.append(f"st_sun≥{self.st_sun_min:.0f}")
+        if self.st_moon_min > 0 * u.deg:
+            constraints.append(f"st_moon≥{self.st_moon_min:.0f}")
+        if self.st_earthlimb_min > 0 * u.deg:
+            constraints.append(f"st_limb≥{self.st_earthlimb_min:.0f}")
+        if self._st_constraint_active:
+            constraints.append(f"st_req={self.st_required}")
 
         constraint_str = ", ".join(constraints) if constraints else "default"
         return f"<Visibility: SAT{self.tle.satnum} [{constraint_str}]>"
@@ -256,6 +282,10 @@ class Visibility:
             constraint_result = self.get_constraint(target_coord, constraint, time)
             result = result & constraint_result
 
+        # Apply star tracker constraints
+        st_result = self.get_star_tracker_constraint(target_coord, time)
+        result = result & st_result
+
         # Return scalar if input was scalar
         if time.isscalar:
             return bool(result)
@@ -294,7 +324,28 @@ class Visibility:
             limb_angle = np.arccos(R_earth / observer_distance)
 
         return alt + limb_angle
-    
+
+    @property
+    def _st_constraint_active(self) -> bool:
+        """Whether any star tracker constraints are active."""
+        return self.st_required > 0 and (
+            self.st_sun_min > 0 * u.deg
+            or self.st_moon_min > 0 * u.deg
+            or self.st_earthlimb_min > 0 * u.deg
+        )
+
+    @property
+    def _st_checks(self) -> list:
+        """Active star tracker constraint checks as (name, limit, key) tuples."""
+        checks = []
+        if self.st_sun_min > 0 * u.deg:
+            checks.append(("sun", self.st_sun_min, "sun_angle"))
+        if self.st_moon_min > 0 * u.deg:
+            checks.append(("moon", self.st_moon_min, "moon_angle"))
+        if self.st_earthlimb_min > 0 * u.deg:
+            checks.append(("limb", self.st_earthlimb_min, "earthlimb_angle"))
+        return checks
+
     @staticmethod
     def _get_star_tracker_body_xyz(tracker: int) -> tuple:
         """
@@ -332,15 +383,16 @@ class Visibility:
         target_coord : SkyCoord
             The science target coordinate (+Z direction)
         time : Time
-            The observation time
+            The observation time (scalar or array)
         tracker : int
             Star tracker number (1 or 2)
             
         Returns:
         --------
         dict
-            Dictionary with 'ra', 'dec', 'sun_angle', 'earth_angle', and 
-            'earthlimb_angle' as Quantities in degrees
+            Dictionary with 'ra', 'dec', 'sun_angle', 'moon_angle',
+            'earth_angle', and 'earthlimb_angle' as Quantities in degrees.
+            Values are scalar or array depending on time input.
             
         Raises:
         -------
@@ -348,80 +400,199 @@ class Visibility:
             If target is too close to the sun (degenerate attitude)
         """
         observer_location = self._get_observer_location(time)
-        
-        # Get target direction unit vector in ECI (GCRS)
-        target_gcrs = target_coord.transform_to('gcrs')
-        target_eci = target_gcrs.cartesian.xyz
-        target_eci = target_eci / np.linalg.norm(target_eci)
-        z_payload = target_eci.value  # payload +Z points at target
-        
-        # Get sun direction unit vector in ECI
+
+        # Reuse _get_star_tracker_skycoord for the boresight direction
+        st_coord = self._get_star_tracker_skycoord(target_coord, time, tracker)
+
+        # Sun angle
         sun_coord = get_body("sun", time=time, location=observer_location)
         sun_gcrs = sun_coord.transform_to('gcrs')
-        sun_eci = sun_gcrs.cartesian.xyz
-        sun_eci = sun_eci / np.linalg.norm(sun_eci)
-        sun_vec = sun_eci.value
-        
-        # Calculate payload coordinate system
-        # +Y = +Z x sun_vector (normalized)
-        y_payload = np.cross(z_payload, sun_vec)
-        y_norm = np.linalg.norm(y_payload)
-        
-        # Check for degenerate case (target aligned with sun)
-        if y_norm < 1e-10:
-            raise ValueError(
-                "Cannot determine attitude: target is aligned with the sun"
-            )
-        y_payload = y_payload / y_norm
-        
-        # +X = +Y x +Z (completes right-handed system)
-        x_payload = np.cross(y_payload, z_payload)
-        x_payload = x_payload / np.linalg.norm(x_payload)
-        
-        # Get star tracker boresight in body frame
-        st_body = np.array(self._get_star_tracker_body_xyz(tracker))
-        
-        # Transform star tracker boresight to ECI frame
-        # Rotation matrix: columns are payload axes in ECI frame
-        R = np.column_stack([x_payload, y_payload, z_payload])
-        st_eci = R @ st_body
-        st_eci = st_eci / np.linalg.norm(st_eci)
-        
-        # Create SkyCoord for star tracker boresight in ECI
-        st_coord = SkyCoord(
-            x=st_eci[0], y=st_eci[1], z=st_eci[2],
-            representation_type='cartesian', frame='gcrs'
-        )
-        
-        # Calculate sun angle (separation between star tracker and sun)
         sun_angle = st_coord.separation(sun_gcrs)
-        
-        # Get observer position in ECI and calculate nadir (Earth center direction)
+
+        # Moon angle
+        moon_coord = get_body("moon", time=time, location=observer_location)
+        moon_angle = st_coord.separation(moon_coord, origin_mismatch="ignore")
+
+        # Earth center angle (nadir direction)
         obs_gcrs = observer_location.get_gcrs(obstime=time)
         obs_eci = obs_gcrs.cartesian.xyz
-        earth_eci = -obs_eci / np.linalg.norm(obs_eci)  # nadir direction
-        
-        # Create SkyCoord for Earth center direction
+        if time.isscalar:
+            earth_eci = -obs_eci / np.linalg.norm(obs_eci)
+        else:
+            earth_eci = -obs_eci / np.linalg.norm(obs_eci, axis=0, keepdims=True)
         earth_coord = SkyCoord(
             x=earth_eci[0], y=earth_eci[1], z=earth_eci[2],
             representation_type='cartesian', frame='gcrs'
         )
-        
-        # Calculate Earth center angle
         earth_angle = st_coord.separation(earth_coord)
-        
-        # Calculate Earth limb angle using existing method
+
+        # Earth limb angle
         earthlimb_angle = self._get_angle_from_earth_limb(
             observer_location, st_coord, time
         )
-        
+
         return {
             'ra': st_coord.spherical.lon.to(u.deg),
             'dec': st_coord.spherical.lat.to(u.deg),
             'sun_angle': sun_angle.to(u.deg),
+            'moon_angle': moon_angle.to(u.deg),
             'earth_angle': earth_angle.to(u.deg),
             'earthlimb_angle': earthlimb_angle.to(u.deg)
         }
+
+    def _get_star_tracker_skycoord(
+        self, target_coord: SkyCoord, time: Time, tracker: int
+    ) -> SkyCoord:
+        """
+        Calculate the sky coordinate where a star tracker boresight points.
+
+        The payload +Z points at the science target. The payload +Y is the
+        cross product of +Z and the sun vector. The payload +X completes the
+        right-handed coordinate system. The star tracker body-frame vector is
+        then rotated into the ECI frame.
+
+        Parameters:
+        -----------
+        target_coord : SkyCoord
+            The science target coordinate (+Z payload direction)
+        time : Time
+            The observation time (scalar or array)
+        tracker : int
+            Star tracker number (1 or 2)
+
+        Returns:
+        --------
+        SkyCoord
+            The GCRS coordinate of the star tracker boresight
+
+        Raises:
+        -------
+        ValueError
+            If target is aligned with the sun (scalar time only)
+        """
+        observer_location = self._get_observer_location(time)
+
+        # Target direction unit vector (constant)
+        target_gcrs = target_coord.transform_to("gcrs")
+        z_payload = target_gcrs.cartesian.xyz.value
+        z_payload = z_payload / np.linalg.norm(z_payload)
+
+        # Sun direction unit vector (time-varying)
+        sun_coord = get_body("sun", time=time, location=observer_location)
+        sun_gcrs = sun_coord.transform_to("gcrs")
+        sun_xyz = sun_gcrs.cartesian.xyz.value
+
+        st_body = np.array(self._get_star_tracker_body_xyz(tracker))
+
+        if time.isscalar:
+            sun_vec = sun_xyz / np.linalg.norm(sun_xyz)
+
+            y_payload = np.cross(z_payload, sun_vec)
+            y_norm = np.linalg.norm(y_payload)
+            if y_norm < 1e-10:
+                raise ValueError(
+                    "Cannot determine attitude: target aligned with sun"
+                )
+            y_payload = y_payload / y_norm
+            x_payload = np.cross(y_payload, z_payload)
+            x_payload = x_payload / np.linalg.norm(x_payload)
+
+            R = np.column_stack([x_payload, y_payload, z_payload])
+            st_eci = R @ st_body
+            st_eci = st_eci / np.linalg.norm(st_eci)
+
+            return SkyCoord(
+                x=st_eci[0],
+                y=st_eci[1],
+                z=st_eci[2],
+                representation_type="cartesian",
+                frame="gcrs",
+            )
+        else:
+            # Array case: sun_xyz shape is (3, N)
+            sun_vec = sun_xyz / np.linalg.norm(sun_xyz, axis=0, keepdims=True)
+            N = len(time)
+            z_payload = np.tile(z_payload.reshape(3, 1), (1, N))
+
+            y_payload = np.cross(z_payload, sun_vec, axis=0)
+            y_norms = np.linalg.norm(y_payload, axis=0, keepdims=True)
+            # Replace near-zero norms to avoid division by zero;
+            # degenerate timesteps will naturally fail boresight sun constraint
+            y_norms = np.where(y_norms < 1e-10, 1.0, y_norms)
+            y_payload = y_payload / y_norms
+
+            x_payload = np.cross(y_payload, z_payload, axis=0)
+            x_payload = x_payload / np.linalg.norm(x_payload, axis=0, keepdims=True)
+
+            # Transform star tracker body vector to ECI for each timestep
+            st_eci = (
+                x_payload * st_body[0] + y_payload * st_body[1] + z_payload * st_body[2]
+            )
+            st_eci = st_eci / np.linalg.norm(st_eci, axis=0, keepdims=True)
+
+            return SkyCoord(
+                x=st_eci[0],
+                y=st_eci[1],
+                z=st_eci[2],
+                representation_type="cartesian",
+                frame="gcrs",
+            )
+
+    def get_star_tracker_constraint(self, target_coord: SkyCoord, time: Time):
+        """
+        Check if the required number of star trackers satisfy all keep-out constraints.
+
+        Evaluates sun, moon, and Earth limb keep-out angles for both star
+        trackers and returns True if self.st_required trackers meet all active
+        constraints (0 = disabled, 1 = at least one, 2 = both).
+
+        Parameters:
+        -----------
+        target_coord : SkyCoord
+            The science target coordinate
+        time : Time
+            The observation time (scalar or array)
+
+        Returns:
+        --------
+        bool or np.ndarray
+            True if the required number of star trackers meet all constraints
+        """
+        if not self._st_constraint_active:
+            if time.isscalar:
+                return True
+            return np.ones(time.shape, dtype=bool)
+
+        checks = self._st_checks
+        tracker_results = []
+
+        for tracker in [1, 2]:
+            try:
+                angles = self.get_star_tracker_angles(
+                    target_coord, time, tracker
+                )
+            except ValueError:
+                if time.isscalar:
+                    tracker_results.append(False)
+                else:
+                    tracker_results.append(np.zeros(time.shape, dtype=bool))
+                continue
+
+            if time.isscalar:
+                tracker_ok = True
+            else:
+                tracker_ok = np.ones(time.shape, dtype=bool)
+
+            for _, limit, key in checks:
+                tracker_ok = tracker_ok & (angles[key] >= limit)
+
+            tracker_results.append(tracker_ok)
+
+        # Combine per-tracker results based on st_required
+        if self.st_required == 1:
+            return tracker_results[0] | tracker_results[1]
+        else:
+            return tracker_results[0] & tracker_results[1]
 
     def get_all_constraints(self, target_coord: SkyCoord, time: Time) -> dict:
         """Get status of all active constraints."""
@@ -436,6 +607,11 @@ class Visibility:
 
         if self.jupiter_min > 0 * u.deg:
             constraints["jupiter"] = self.get_constraint(target_coord, "jupiter", time)
+
+        if self._st_constraint_active:
+            constraints["star_tracker"] = self.get_star_tracker_constraint(
+                target_coord, time
+            )
 
         return constraints
 
@@ -503,6 +679,8 @@ class Visibility:
         ]
 
         for body in constraints:
+            if body == "star_tracker":
+                continue  # handled in dedicated section below
             status = "PASS" if constraints[body] else "FAIL"
             status_symbol = "✓" if constraints[body] else "✗"
             min_sep = getattr(self, f"{body}_min")
@@ -512,6 +690,40 @@ class Visibility:
                 f"{body.capitalize():<10} {status_symbol} {status:<4} "
                 f"(req: {min_sep:>6.1f}, actual: {actual_sep:>6.1f})"
             )
+
+        # Star tracker constraints section
+        if self._st_constraint_active:
+            lines.append("-" * 60)
+            req_label = "both" if self.st_required == 2 else "≥1"
+            lines.append(f"Star Tracker Constraints (need {req_label} tracker passing):")
+
+            for tracker in [1, 2]:
+                try:
+                    angles = self.get_star_tracker_angles(
+                        target_coord, time, tracker
+                    )
+                    tracker_pass = True
+                    details = []
+                    for name, limit, key in self._st_checks:
+                        actual = angles[key]
+                        ok = bool(actual >= limit)
+                        tracker_pass = tracker_pass and ok
+                        sym = "✓" if ok else "✗"
+                        details.append(
+                            f"{name}:{sym} req:{limit:>6.1f} act:{actual:>6.1f}"
+                        )
+                    symbol = "✓" if tracker_pass else "✗"
+                    status = "PASS" if tracker_pass else "FAIL"
+                    lines.append(f"  ST{tracker:<8}{symbol} {status}")
+                    for d in details:
+                        lines.append(f"    {d}")
+                except ValueError as e:
+                    lines.append(f"  ST{tracker:<8}✗ ERROR ({e})")
+
+            st_combined = self.get_star_tracker_constraint(target_coord, time)
+            st_sym = "✓" if st_combined else "✗"
+            st_stat = "PASS" if st_combined else "FAIL"
+            lines.append(f"  {'Result':<9}{st_sym} {st_stat}")
 
         overall_status = (
             "VISIBLE" if self.get_visibility(target_coord, time) else "NOT VISIBLE"
