@@ -273,6 +273,30 @@ class TestVisibilityClassMethods:
         assert len(states) == 5
         assert isinstance(states, SkyCoord)
 
+    def test_get_visibility_list_of_coords(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Test get_visibility with a list of target coordinates."""
+        single_result = visibility_instance.get_visibility(target_coord, test_time)
+        list_result = visibility_instance.get_visibility([target_coord] * 5, test_time)
+
+        assert isinstance(list_result, np.ndarray)
+        assert list_result.shape == (5,)
+        assert all(r == single_result for r in list_result)
+
+    def test_get_visibility_list_of_coords_with_st(self, target_coord, test_time):
+        """Test get_visibility with list of coords and star tracker constraints."""
+        line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
+        line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+        vis = Visibility(line1, line2, st_sun_min=44 * u.deg)
+
+        single_result = vis.get_visibility(target_coord, test_time)
+        list_result = vis.get_visibility([target_coord] * 5, test_time)
+
+        assert isinstance(list_result, np.ndarray)
+        assert list_result.shape == (5,)
+        assert all(r == single_result for r in list_result)
+
     def test_get_star_tracker_angles_return_structure(
         self, visibility_instance, target_coord, test_time
     ):

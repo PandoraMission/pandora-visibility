@@ -252,8 +252,10 @@ class Visibility:
 
         Parameters:
         -----------
-        target_coord : SkyCoord
-            The target coordinate to compare with.
+        target_coord : SkyCoord or list of SkyCoord
+            The target coordinate(s) to compare with. If a list is provided,
+            visibility is computed for each target independently and an array
+            of results is returned.
         time : astropy.time.Time
             The time at which to calculate the constraint. Can be scalar or array.
 
@@ -261,8 +263,14 @@ class Visibility:
         --------
         bool or np.ndarray
             True if the target is visible, False otherwise.
-            Returns array if time is an array.
+            Returns array if time is an array or target_coord is a list.
         """
+        # Handle list of target coordinates by iterating over each target
+        if isinstance(target_coord, list):
+            return np.array(
+                [self.get_visibility(tc, time) for tc in target_coord]
+            )
+
         # Always check these constraints
         required_constraints = ["moon", "sun", "earthlimb"]
 
