@@ -628,6 +628,28 @@ class TestStarTrackerConstraints:
         assert isinstance(sc, SkyCoord)
         assert sc.shape == times.shape
 
+    def test_degenerate_sun_aligned_array(self, line1, line2):
+        """Degenerate timesteps (target=sun) produce NaN boresight, constraint=False."""
+        vis = Visibility(line1, line2, st_sun_min=44 * u.deg)
+        test_time = Time("2025-06-21T12:00:00")
+        observer_location = vis._get_observer_location(test_time)
+        sun_coord = get_body("sun", time=test_time, location=observer_location)
+
+        # Use the sun position as target — degenerate attitude
+        normal_target = SkyCoord(79.17, 45.99, frame="icrs", unit="deg")
+        times = Time("2025-06-21T12:00:00") + np.array([0, 1]) * u.hour
+
+        # Should not raise; degenerate indices should just give False constraint
+        sc = vis._get_star_tracker_skycoord(sun_coord, times, tracker=1)
+        assert sc.shape == times.shape
+        # Degenerate timesteps should have NaN coordinates
+        assert np.any(np.isnan(sc.cartesian.xyz.value))
+
+        # Constraint should return False for degenerate timesteps
+        result = vis.get_star_tracker_constraint(sun_coord, times)
+        assert result.shape == times.shape
+        assert result.dtype == bool
+
     def test_st_required_default_is_one(self, line1, line2):
         """st_required defaults to 1."""
         vis = Visibility(line1, line2)

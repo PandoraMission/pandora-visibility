@@ -526,19 +526,29 @@ class Visibility:
 
             y_payload = np.cross(z_payload, sun_vec, axis=0)
             y_norms = np.linalg.norm(y_payload, axis=0, keepdims=True)
-            # Replace near-zero norms to avoid division by zero;
-            # degenerate timesteps will naturally fail boresight sun constraint
-            y_norms = np.where(y_norms < 1e-10, 1.0, y_norms)
-            y_payload = y_payload / y_norms
+
+            # Detect degenerate timesteps where target is aligned with sun
+            degenerate = (y_norms < 1e-10).ravel()
+
+            # Safe-divide: set degenerate norms to 1 to avoid division by zero,
+            # then overwrite those columns with NaN so they propagate cleanly
+            y_norms_safe = np.where(y_norms < 1e-10, 1.0, y_norms)
+            y_payload = y_payload / y_norms_safe
 
             x_payload = np.cross(y_payload, z_payload, axis=0)
-            x_payload = x_payload / np.linalg.norm(x_payload, axis=0, keepdims=True)
+            x_norms = np.linalg.norm(x_payload, axis=0, keepdims=True)
+            x_norms_safe = np.where(x_norms < 1e-10, 1.0, x_norms)
+            x_payload = x_payload / x_norms_safe
 
             # Transform star tracker body vector to ECI for each timestep
             st_eci = (
                 x_payload * st_body[0] + y_payload * st_body[1] + z_payload * st_body[2]
             )
             st_eci = st_eci / np.linalg.norm(st_eci, axis=0, keepdims=True)
+
+            # Mark degenerate timesteps with NaN so downstream separations
+            # return NaN (which compares as False against any threshold)
+            st_eci[:, degenerate] = np.nan
 
             return SkyCoord(
                 x=st_eci[0],
