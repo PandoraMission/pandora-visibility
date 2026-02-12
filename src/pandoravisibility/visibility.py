@@ -614,9 +614,14 @@ class Visibility:
 
         # Combine per-tracker results based on st_required
         if self.st_required == 1:
-            return tracker_results[0] | tracker_results[1]
+            combined = tracker_results[0] | tracker_results[1]
         else:
-            return tracker_results[0] & tracker_results[1]
+            combined = tracker_results[0] & tracker_results[1]
+
+        # Normalize scalar result to plain Python bool
+        if time.isscalar:
+            return bool(combined)
+        return combined
 
     def get_all_constraints(self, target_coord: SkyCoord, time: Time) -> dict:
         """Get status of all active constraints."""

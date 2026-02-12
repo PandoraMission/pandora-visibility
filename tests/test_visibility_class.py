@@ -587,7 +587,7 @@ class TestStarTrackerConstraints:
         """A 180° ST sun limit should fail (impossible to satisfy)."""
         vis = Visibility(line1, line2, st_sun_min=180 * u.deg)
         result = vis.get_star_tracker_constraint(target_coord, test_time)
-        assert result is False or result == False  # noqa: E712
+        assert result is False
 
     def test_constraint_with_small_sun_limit(
         self, line1, line2, target_coord, test_time
