@@ -263,7 +263,10 @@ class Visibility:
         --------
         bool or np.ndarray
             True if the target is visible, False otherwise.
-            Returns array if time is an array or target_coord is a list.
+            - Scalar coord + scalar time → bool
+            - Scalar coord + array time (M,) → np.ndarray of bool, shape (M,)
+            - N coords (list or array) + scalar time → np.ndarray of bool, shape (N,)
+            - N coords (list or array) + array time (M,) → np.ndarray of bool, shape (N, M)
         """
         # Handle multiple target coordinates (list or array SkyCoord)
         # Each target defines a different boresight, so must be evaluated independently

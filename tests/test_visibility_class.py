@@ -319,6 +319,22 @@ class TestVisibilityClassMethods:
             assert result.shape == (expected_len,)
             assert all(r == single for r in result)
 
+    def test_get_visibility_multi_target_array_time(
+        self, visibility_instance, target_coord
+    ):
+        """Multi-target + array time returns 2D bool array of shape (N, M)."""
+        targets = [target_coord] * 3
+        times = Time("2025-01-01T00:00:00") + np.arange(5) * u.hour
+
+        result = visibility_instance.get_visibility(targets, times)
+        single = visibility_instance.get_visibility(target_coord, times)
+
+        assert isinstance(result, np.ndarray)
+        assert result.dtype == bool
+        assert result.shape == (3, 5)
+        for row in result:
+            np.testing.assert_array_equal(row, single)
+
     def test_get_star_tracker_angles_return_structure(
         self, visibility_instance, target_coord, test_time
     ):
