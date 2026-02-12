@@ -273,29 +273,51 @@ class TestVisibilityClassMethods:
         assert len(states) == 5
         assert isinstance(states, SkyCoord)
 
-    def test_get_visibility_list_of_coords(
-        self, visibility_instance, target_coord, test_time
+    @pytest.fixture(params=["scalar", "list", "skycoord_array"])
+    def target_inputs(self, request, target_coord):
+        """Provide target_coord in all supported input forms."""
+        if request.param == "scalar":
+            return target_coord, 1
+        elif request.param == "list":
+            return [target_coord] * 3, 3
+        else:
+            return SkyCoord([79.17] * 3, [45.99] * 3, frame="icrs", unit="deg"), 3
+
+    def test_get_visibility_target_forms(
+        self, visibility_instance, target_coord, target_inputs, test_time
     ):
-        """Test get_visibility with a list of target coordinates."""
-        single_result = visibility_instance.get_visibility(target_coord, test_time)
-        list_result = visibility_instance.get_visibility([target_coord] * 5, test_time)
+        """Test get_visibility with scalar, list, and SkyCoord array targets."""
+        targets, expected_len = target_inputs
+        result = visibility_instance.get_visibility(targets, test_time)
+        single = visibility_instance.get_visibility(target_coord, test_time)
 
-        assert isinstance(list_result, np.ndarray)
-        assert list_result.shape == (5,)
-        assert all(r == single_result for r in list_result)
+        if expected_len == 1:
+            assert isinstance(result, bool)
+            assert result == single
+        else:
+            assert isinstance(result, np.ndarray)
+            assert result.shape == (expected_len,)
+            assert all(r == single for r in result)
 
-    def test_get_visibility_list_of_coords_with_st(self, target_coord, test_time):
-        """Test get_visibility with list of coords and star tracker constraints."""
+    def test_get_visibility_target_forms_with_st(
+        self, target_coord, target_inputs, test_time
+    ):
+        """Test get_visibility target forms with star tracker constraints."""
         line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
         line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
         vis = Visibility(line1, line2, st_sun_min=44 * u.deg)
 
-        single_result = vis.get_visibility(target_coord, test_time)
-        list_result = vis.get_visibility([target_coord] * 5, test_time)
+        targets, expected_len = target_inputs
+        result = vis.get_visibility(targets, test_time)
+        single = vis.get_visibility(target_coord, test_time)
 
-        assert isinstance(list_result, np.ndarray)
-        assert list_result.shape == (5,)
-        assert all(r == single_result for r in list_result)
+        if expected_len == 1:
+            assert isinstance(result, bool)
+            assert result == single
+        else:
+            assert isinstance(result, np.ndarray)
+            assert result.shape == (expected_len,)
+            assert all(r == single for r in result)
 
     def test_get_star_tracker_angles_return_structure(
         self, visibility_instance, target_coord, test_time

@@ -265,10 +265,13 @@ class Visibility:
             True if the target is visible, False otherwise.
             Returns array if time is an array or target_coord is a list.
         """
-        # Handle list of target coordinates by iterating over each target
+        # Handle multiple target coordinates (list or array SkyCoord)
+        # Each target defines a different boresight, so must be evaluated independently
         if isinstance(target_coord, list):
+            return np.array([self.get_visibility(tc, time) for tc in target_coord])
+        if hasattr(target_coord, "shape") and target_coord.shape != ():
             return np.array(
-                [self.get_visibility(tc, time) for tc in target_coord]
+                [self.get_visibility(target_coord[i], time) for i in range(len(target_coord))]
             )
 
         # Always check these constraints
