@@ -7,6 +7,8 @@ from sgp4.api import SGP4_ERRORS, Satrec
 
 __all__ = ["Visibility"]
 
+_R_EARTH_M = R_earth.to(u.m).value
+
 
 class Visibility:
     """
@@ -248,8 +250,29 @@ class Visibility:
 
     # ------------------------------------------------------------------
     # Internal fast-path helpers: precompute time-dependent data once,
-    # then evaluate each target cheaply.
+    # then evaluate each target cheaply using numpy dot products.
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fast_sep_deg(a, b):
+        """Angular separation in degrees between (3,...) unit vectors.
+
+        Supports shapes (3,)·(3,), (3,N)·(3,N), or (3,1)·(3,N).
+        """
+        dot = np.sum(a * b, axis=0)
+        return np.rad2deg(np.arccos(np.clip(dot, -1.0, 1.0)))
+
+    @staticmethod
+    def _fast_limb_deg(target_unit, zenith_unit, limb_angle_rad):
+        """Earth limb angle in degrees via geometric calculation.
+
+        elev = arcsin(dot(target, zenith))  [altitude above local horizon]
+        limb = arccos(R_earth / observer_dist)
+        result = elev + limb
+        """
+        dot = np.sum(target_unit * zenith_unit, axis=0)
+        elev = np.arcsin(np.clip(dot, -1.0, 1.0))
+        return np.rad2deg(elev + limb_angle_rad)
 
     def _precompute(self, time: Time) -> dict:
         """Precompute time-dependent quantities shared across targets.
@@ -257,178 +280,186 @@ class Visibility:
         Everything in the returned dict depends only on the observation
         time(s) and satellite orbit, not on the science target.  Passing
         this dict to ``_get_visibility_single`` avoids redundant SGP4
-        propagation and ephemeris lookups when evaluating many targets.
+        propagation, ephemeris lookups, and coordinate transforms.
         """
         observer_location = self._get_observer_location(time)
 
-        bodies = {}
+        # Observer GCRS position → zenith direction + Earth limb angle
+        obs_gcrs = observer_location.get_gcrs(obstime=time)
+        obs_xyz = obs_gcrs.cartesian.xyz.to(u.m).value  # (3,) or (3, N)
+        if time.isscalar:
+            obs_dist = np.linalg.norm(obs_xyz)
+            zenith_unit = obs_xyz / obs_dist
+        else:
+            obs_dist = np.linalg.norm(obs_xyz, axis=0)  # (N,)
+            zenith_unit = obs_xyz / obs_dist[np.newaxis, :]  # (3, N)
+
+        with np.errstate(invalid="ignore"):
+            limb_angle_rad = np.arccos(_R_EARTH_M / obs_dist)  # scalar or (N,)
+
+        # Body direction unit vectors (normalised cartesian xyz)
+        body_units = {}
         for name in ["moon", "sun"]:
-            bodies[name] = get_body(name, time=time, location=observer_location)
-        if self.mars_min > 0 * u.deg:
-            bodies["mars"] = get_body("mars", time=time, location=observer_location)
-        if self.jupiter_min > 0 * u.deg:
-            bodies["jupiter"] = get_body(
-                "jupiter", time=time, location=observer_location
-            )
-
-        pre = {
-            "observer_location": observer_location,
-            "bodies": bodies,
-        }
-
-        # Extra transforms needed by the star-tracker fast path
-        if self._st_constraint_active:
-            pre["sun_gcrs"] = bodies["sun"].transform_to("gcrs")
-            pre["moon_gcrs"] = bodies["moon"].transform_to("gcrs")
-            sun_xyz = pre["sun_gcrs"].cartesian.xyz.value
+            body = get_body(name, time=time, location=observer_location)
+            xyz = body.cartesian.xyz.value
             if time.isscalar:
-                pre["sun_vec"] = sun_xyz / np.linalg.norm(sun_xyz)
+                body_units[name] = xyz / np.linalg.norm(xyz)
             else:
-                pre["sun_vec"] = sun_xyz / np.linalg.norm(
-                    sun_xyz, axis=0, keepdims=True
+                body_units[name] = xyz / np.linalg.norm(
+                    xyz, axis=0, keepdims=True
+                )
+        if self.mars_min > 0 * u.deg:
+            body = get_body("mars", time=time, location=observer_location)
+            xyz = body.cartesian.xyz.value
+            if time.isscalar:
+                body_units["mars"] = xyz / np.linalg.norm(xyz)
+            else:
+                body_units["mars"] = xyz / np.linalg.norm(
+                    xyz, axis=0, keepdims=True
+                )
+        if self.jupiter_min > 0 * u.deg:
+            body = get_body("jupiter", time=time, location=observer_location)
+            xyz = body.cartesian.xyz.value
+            if time.isscalar:
+                body_units["jupiter"] = xyz / np.linalg.norm(xyz)
+            else:
+                body_units["jupiter"] = xyz / np.linalg.norm(
+                    xyz, axis=0, keepdims=True
                 )
 
-        return pre
+        return {
+            "observer_location": observer_location,
+            "body_units": body_units,
+            "zenith_unit": zenith_unit,
+            "limb_angle_rad": limb_angle_rad,
+        }
 
     def _get_visibility_single(
         self, target_coord: SkyCoord, time: Time, pre: dict
     ):
         """Visibility for one scalar target using precomputed time data."""
-        observer_location = pre["observer_location"]
-        bodies = pre["bodies"]
+        body_units = pre["body_units"]
+        zenith_unit = pre["zenith_unit"]
+        limb_rad = pre["limb_angle_rad"]
 
-        # Boresight body constraints
-        result = (
-            bodies["moon"].separation(target_coord, origin_mismatch="ignore")
-            >= self.moon_min
-        )
-        result = result & (
-            bodies["sun"].separation(target_coord, origin_mismatch="ignore")
-            >= self.sun_min
-        )
-        result = result & (
-            self._get_angle_from_earth_limb(observer_location, target_coord, time)
-            >= self.earthlimb_min
-        )
+        # Target direction unit vector (computed once per target)
+        tgt_xyz = target_coord.transform_to("gcrs").cartesian.xyz.value
+        tgt_unit = tgt_xyz / np.linalg.norm(tgt_xyz)  # (3,)
+
+        # Broadcast for array time: (3,) → (3, 1)
+        tgt_b = tgt_unit[:, np.newaxis] if not time.isscalar else tgt_unit
+
+        # Boresight body constraints via fast dot-product separation
+        moon_deg = self.moon_min.to(u.deg).value
+        sun_deg = self.sun_min.to(u.deg).value
+        limb_deg = self.earthlimb_min.to(u.deg).value
+
+        result = self._fast_sep_deg(body_units["moon"], tgt_b) >= moon_deg
+        result &= self._fast_sep_deg(body_units["sun"], tgt_b) >= sun_deg
+        result &= self._fast_limb_deg(tgt_b, zenith_unit, limb_rad) >= limb_deg
 
         if self.mars_min > 0 * u.deg:
-            result = result & (
-                bodies["mars"].separation(target_coord, origin_mismatch="ignore")
-                >= self.mars_min
+            result &= (
+                self._fast_sep_deg(body_units["mars"], tgt_b)
+                >= self.mars_min.to(u.deg).value
             )
         if self.jupiter_min > 0 * u.deg:
-            result = result & (
-                bodies["jupiter"].separation(target_coord, origin_mismatch="ignore")
-                >= self.jupiter_min
+            result &= (
+                self._fast_sep_deg(body_units["jupiter"], tgt_b)
+                >= self.jupiter_min.to(u.deg).value
             )
 
         # Star tracker constraints
         if self._st_constraint_active:
-            st_result = self._get_st_constraint_fast(target_coord, time, pre)
+            st_result = self._get_st_constraint_fast(tgt_unit, time, pre)
             result = result & st_result
 
         if time.isscalar:
             return bool(result)
         return np.asarray(result)
 
-    def _get_st_skycoord_fast(
-        self, target_coord: SkyCoord, time: Time, tracker: int, pre: dict
-    ) -> SkyCoord:
-        """Star tracker boresight using precomputed sun vector."""
-        z_payload_raw = target_coord.transform_to("gcrs").cartesian.xyz.value
-        z_payload = z_payload_raw / np.linalg.norm(z_payload_raw)
-        sun_vec = pre["sun_vec"]
-        st_body = np.array(self._get_star_tracker_body_xyz(tracker))
+    def _get_st_constraint_fast(self, tgt_unit, time, pre):
+        """Star tracker constraint check using pure numpy.
 
+        Computes the payload attitude matrix once and applies it to both
+        tracker boresight vectors.  Angular separations use dot products
+        instead of SkyCoord.separation().
+
+        Parameters
+        ----------
+        tgt_unit : np.ndarray
+            Target direction as (3,) unit vector in GCRS.
+        time : Time
+            Observation time (scalar or array).
+        pre : dict
+            Precomputed data from ``_precompute()``.
+        """
+        checks = self._st_checks
+        body_units = pre["body_units"]
+        zenith_unit = pre["zenith_unit"]
+        limb_rad = pre["limb_angle_rad"]
+        sun_vec = body_units["sun"]
+
+        # Compute payload attitude ONCE for both trackers
         if time.isscalar:
-            y_payload = np.cross(z_payload, sun_vec)
+            y_payload = np.cross(tgt_unit, sun_vec)
             y_norm = np.linalg.norm(y_payload)
             if y_norm < 1e-10:
-                raise ValueError(
-                    "Cannot determine attitude: target aligned with sun"
-                )
+                return False  # degenerate: both trackers fail
             y_payload = y_payload / y_norm
-            x_payload = np.cross(y_payload, z_payload)
+            x_payload = np.cross(y_payload, tgt_unit)
             x_payload = x_payload / np.linalg.norm(x_payload)
-
-            R = np.column_stack([x_payload, y_payload, z_payload])
-            st_eci = R @ st_body
-            st_eci = st_eci / np.linalg.norm(st_eci)
-
-            return SkyCoord(
-                x=st_eci[0],
-                y=st_eci[1],
-                z=st_eci[2],
-                representation_type="cartesian",
-                frame="gcrs",
-            )
+            z_col = tgt_unit
         else:
             N = len(time)
-            z_payload = np.tile(z_payload.reshape(3, 1), (1, N))
-
-            y_payload = np.cross(z_payload, sun_vec, axis=0)
+            z_col = np.tile(tgt_unit.reshape(3, 1), (1, N))
+            y_payload = np.cross(z_col, sun_vec, axis=0)
             y_norms = np.linalg.norm(y_payload, axis=0, keepdims=True)
             degenerate = (y_norms < 1e-10).ravel()
-            y_norms_safe = np.where(y_norms < 1e-10, 1.0, y_norms)
-            y_payload = y_payload / y_norms_safe
-
-            x_payload = np.cross(y_payload, z_payload, axis=0)
+            y_payload = y_payload / np.where(y_norms < 1e-10, 1.0, y_norms)
+            x_payload = np.cross(y_payload, z_col, axis=0)
             x_norms = np.linalg.norm(x_payload, axis=0, keepdims=True)
-            x_norms_safe = np.where(x_norms < 1e-10, 1.0, x_norms)
-            x_payload = x_payload / x_norms_safe
+            x_payload = x_payload / np.where(x_norms < 1e-10, 1.0, x_norms)
 
-            st_eci = (
-                x_payload * st_body[0]
-                + y_payload * st_body[1]
-                + z_payload * st_body[2]
-            )
-            st_eci = st_eci / np.linalg.norm(st_eci, axis=0, keepdims=True)
-            st_eci[:, degenerate] = np.nan
-
-            return SkyCoord(
-                x=st_eci[0],
-                y=st_eci[1],
-                z=st_eci[2],
-                representation_type="cartesian",
-                frame="gcrs",
-            )
-
-    def _get_st_constraint_fast(
-        self, target_coord: SkyCoord, time: Time, pre: dict
-    ):
-        """Star tracker constraint using precomputed data."""
-        checks = self._st_checks
         tracker_results = []
 
         for tracker in [1, 2]:
-            try:
-                st_coord = self._get_st_skycoord_fast(
-                    target_coord, time, tracker, pre
-                )
-            except ValueError:
-                if time.isscalar:
-                    tracker_results.append(False)
-                else:
-                    tracker_results.append(np.zeros(time.shape, dtype=bool))
-                continue
+            st_body = np.array(self._get_star_tracker_body_xyz(tracker))
 
+            # Rotate body-frame vector to ECI
+            st_eci = (
+                x_payload * st_body[0]
+                + y_payload * st_body[1]
+                + z_col * st_body[2]
+            )
+
+            if time.isscalar:
+                st_norm = np.linalg.norm(st_eci)
+                if st_norm < 1e-10:
+                    tracker_results.append(False)
+                    continue
+                st_eci = st_eci / st_norm
+            else:
+                st_eci = st_eci / np.linalg.norm(st_eci, axis=0, keepdims=True)
+                st_eci[:, degenerate] = np.nan
+
+            # Check each constraint via dot-product separation
             if time.isscalar:
                 tracker_ok = True
             else:
                 tracker_ok = np.ones(time.shape, dtype=bool)
 
             for _, limit, key in checks:
+                limit_deg = limit.to(u.deg).value
                 if key == "sun_angle":
-                    angle = st_coord.separation(pre["sun_gcrs"]).to(u.deg)
+                    sep = self._fast_sep_deg(st_eci, body_units["sun"])
                 elif key == "moon_angle":
-                    angle = st_coord.separation(pre["moon_gcrs"]).to(u.deg)
+                    sep = self._fast_sep_deg(st_eci, body_units["moon"])
                 elif key == "earthlimb_angle":
-                    angle = self._get_angle_from_earth_limb(
-                        pre["observer_location"], st_coord, time
-                    ).to(u.deg)
+                    sep = self._fast_limb_deg(st_eci, zenith_unit, limb_rad)
                 else:
                     continue
-                tracker_ok = tracker_ok & (angle >= limit)
+                tracker_ok = tracker_ok & (sep >= limit_deg)
 
             tracker_results.append(tracker_ok)
 
