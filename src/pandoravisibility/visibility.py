@@ -1,7 +1,7 @@
 import numpy as np
 from astropy import units as u
 from astropy.constants import R_earth
-from astropy.coordinates import TEME, AltAz, EarthLocation, SkyCoord, get_body
+from astropy.coordinates import GCRS, TEME, AltAz, EarthLocation, SkyCoord, get_body
 from astropy.time import Time
 from sgp4.api import SGP4_ERRORS, Satrec
 
@@ -653,7 +653,7 @@ class Visibility:
             y=earth_eci.value[1],
             z=earth_eci.value[2],
             representation_type="cartesian",
-            frame="gcrs",
+            frame=GCRS(obstime=time),
         )
         earth_angle = st_coord.separation(earth_coord)
 
@@ -735,7 +735,7 @@ class Visibility:
                 y=st_eci[1],
                 z=st_eci[2],
                 representation_type="cartesian",
-                frame="gcrs",
+                frame=GCRS(obstime=time),
             )
         else:
             # Array case: sun_xyz shape is (3, N)
@@ -774,7 +774,7 @@ class Visibility:
                 y=st_eci[1],
                 z=st_eci[2],
                 representation_type="cartesian",
-                frame="gcrs",
+                frame=GCRS(obstime=time),
             )
 
     def get_star_tracker_constraint(self, target_coord: SkyCoord, time: Time):

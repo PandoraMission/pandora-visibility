@@ -404,6 +404,32 @@ class TestVisibilityClassMethods:
         # This threshold accounts for the geometric difference in tracker orientations
         assert ra_diff > 1.0 * u.deg or dec_diff > 1.0 * u.deg
 
+    def test_get_star_tracker_sun_angle_symmetry(
+        self, visibility_instance, target_coord, test_time
+    ):
+        """Regression: ST1 and ST2 must have equal sun angles.
+
+        The sun lies in the spacecraft XZ plane (zero Y-component in body
+        frame) and the two star tracker boresights are symmetric about
+        that plane (+/-0.7071 in Y).  Therefore both trackers must see
+        exactly the same angular separation to the sun.
+
+        This test catches the bug where SkyCoord was created with bare
+        ``frame="gcrs"`` (defaulting obstime=J2000), which caused
+        astropy's ``separation()`` to apply an incorrect geocenter offset
+        when comparing against a GCRS body at the observation epoch.
+        Before the fix, ST2 sun angle was wrong by ~22 degrees.
+        """
+        result1 = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=1
+        )
+        result2 = visibility_instance.get_star_tracker_angles(
+            target_coord, test_time, tracker=2
+        )
+
+        # Sun angles must match to within 0.01 degrees
+        assert abs(result1["sun_angle"] - result2["sun_angle"]) < 0.01 * u.deg
+
     def test_get_star_tracker_angles_sun_angle(
         self, visibility_instance, target_coord, test_time
     ):
