@@ -342,8 +342,9 @@ class Visibility:
         zenith_unit = pre["zenith_unit"]
         limb_rad = pre["limb_angle_rad"]
 
-        # Target direction unit vector (computed once per target)
-        tgt_xyz = target_coord.transform_to("gcrs").cartesian.xyz.value
+        # Target direction unit vector in epoch-matched GCRS
+        ref_time = time if time.isscalar else time[0]
+        tgt_xyz = target_coord.transform_to(GCRS(obstime=ref_time)).cartesian.xyz.value
         tgt_unit = tgt_xyz / np.linalg.norm(tgt_xyz)  # (3,)
 
         # Broadcast for array time: (3,) → (3, 1)
@@ -402,7 +403,7 @@ class Visibility:
 
         # Compute payload attitude ONCE for both trackers
         if time.isscalar:
-            y_payload = np.cross(tgt_unit, sun_vec)
+            y_payload = np.cross(sun_vec, tgt_unit)
             y_norm = np.linalg.norm(y_payload)
             if y_norm < 1e-10:
                 return False  # degenerate: both trackers fail
@@ -413,7 +414,7 @@ class Visibility:
         else:
             N = len(time)
             z_col = np.tile(tgt_unit.reshape(3, 1), (1, N))
-            y_payload = np.cross(z_col, sun_vec, axis=0)
+            y_payload = np.cross(sun_vec, z_col, axis=0)
             y_norms = np.linalg.norm(y_payload, axis=0, keepdims=True)
             degenerate = (y_norms < 1e-10).ravel()
             y_payload = y_payload / np.where(y_norms < 1e-10, 1.0, y_norms)
@@ -605,7 +606,7 @@ class Visibility:
         Calculate the star tracker sun and Earth angles.
 
         The payload +Z points at the science target.
-        The payload +Y is the cross product of +Z and the sun vector.
+        The payload +Y is the cross product of the sun vector and +Z.
         The payload +X completes the right-handed coordinate system.
 
         Parameters:
@@ -633,15 +634,16 @@ class Visibility:
 
         # Sun angle
         sun_coord = get_body("sun", time=time, location=observer_location)
-        sun_gcrs = sun_coord.transform_to("gcrs")
-        sun_angle = st_coord.separation(sun_gcrs)
+        sun_angle = st_coord.separation(sun_coord)
 
         # Moon angle
         moon_coord = get_body("moon", time=time, location=observer_location)
-        moon_gcrs = moon_coord.transform_to("gcrs")
-        moon_angle = st_coord.separation(moon_gcrs)
+        moon_angle = st_coord.separation(moon_coord)
 
-        # Earth center angle (nadir direction)
+        # Earth center angle (nadir direction).
+        # Use the same topocentric frame as st_coord so separation() does not
+        # need a frame translation (which would distort nearby unit-distance
+        # SkyCoords).
         obs_gcrs = observer_location.get_gcrs(obstime=time)
         obs_eci = obs_gcrs.cartesian.xyz
         if time.isscalar:
@@ -653,7 +655,7 @@ class Visibility:
             y=earth_eci.value[1],
             z=earth_eci.value[2],
             representation_type="cartesian",
-            frame=GCRS(obstime=time),
+            frame=st_coord.frame,
         )
         earth_angle = st_coord.separation(earth_coord)
 
@@ -678,7 +680,7 @@ class Visibility:
         Calculate the sky coordinate where a star tracker boresight points.
 
         The payload +Z points at the science target. The payload +Y is the
-        cross product of +Z and the sun vector. The payload +X completes the
+        cross product of the sun vector and +Z. The payload +X completes the
         right-handed coordinate system. The star tracker body-frame vector is
         then rotated into the ECI frame.
 
@@ -703,22 +705,33 @@ class Visibility:
         """
         observer_location = self._get_observer_location(time)
 
-        # Target direction unit vector (constant)
-        target_gcrs = target_coord.transform_to("gcrs")
+        # Satellite GCRS frame (topocentric: obsgeoloc = satellite position).
+        # Body SkyCoords from get_body(location=observer_location) carry the
+        # same obsgeoloc, so separation() won't apply a spurious origin
+        # translation that shifts the Moon direction by up to ~1 deg.
+        obs_gcrs = observer_location.get_gcrs(obstime=time)
+        sat_gcrs_frame = GCRS(
+            obstime=time,
+            obsgeoloc=obs_gcrs.cartesian.without_differentials(),
+            obsgeovel=obs_gcrs.velocity.d_xyz,
+        )
+
+        # Target direction unit vector in epoch-matched GCRS
+        ref_time = time if time.isscalar else time[0]
+        target_gcrs = target_coord.transform_to(GCRS(obstime=ref_time))
         z_payload = target_gcrs.cartesian.xyz.value
         z_payload = z_payload / np.linalg.norm(z_payload)
 
         # Sun direction unit vector (time-varying)
         sun_coord = get_body("sun", time=time, location=observer_location)
-        sun_gcrs = sun_coord.transform_to("gcrs")
-        sun_xyz = sun_gcrs.cartesian.xyz.value
+        sun_xyz = sun_coord.cartesian.xyz.value
 
         st_body = np.array(self._get_star_tracker_body_xyz(tracker))
 
         if time.isscalar:
             sun_vec = sun_xyz / np.linalg.norm(sun_xyz)
 
-            y_payload = np.cross(z_payload, sun_vec)
+            y_payload = np.cross(sun_vec, z_payload)
             y_norm = np.linalg.norm(y_payload)
             if y_norm < 1e-10:
                 raise ValueError("Cannot determine attitude: target aligned with sun")
@@ -735,7 +748,7 @@ class Visibility:
                 y=st_eci[1],
                 z=st_eci[2],
                 representation_type="cartesian",
-                frame=GCRS(obstime=time),
+                frame=sat_gcrs_frame,
             )
         else:
             # Array case: sun_xyz shape is (3, N)
@@ -743,7 +756,7 @@ class Visibility:
             N = len(time)
             z_payload = np.tile(z_payload.reshape(3, 1), (1, N))
 
-            y_payload = np.cross(z_payload, sun_vec, axis=0)
+            y_payload = np.cross(sun_vec, z_payload, axis=0)
             y_norms = np.linalg.norm(y_payload, axis=0, keepdims=True)
 
             # Detect degenerate timesteps where target is aligned with sun
@@ -774,7 +787,7 @@ class Visibility:
                 y=st_eci[1],
                 z=st_eci[2],
                 representation_type="cartesian",
-                frame=GCRS(obstime=time),
+                frame=sat_gcrs_frame,
             )
 
     def get_star_tracker_constraint(self, target_coord: SkyCoord, time: Time):
