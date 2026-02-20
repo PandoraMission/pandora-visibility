@@ -852,6 +852,8 @@ class Visibility:
                     best_orbit_roll = roll_degs[
                         candidates[np.argmax(avg_power)]
                     ]
+                    # Normalize to [-180, 180]
+                    best_orbit_roll = (best_orbit_roll + 180) % 360 - 180
 
             # ── Evaluate at input times with orbit-optimal roll ───
             pre_inp = self._precompute(chunk_times)

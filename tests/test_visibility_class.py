@@ -1130,13 +1130,13 @@ class TestBestRoll:
             assert np.all(np.isfinite(result["solar_power_frac"][vis_mask]))
 
     def test_roll_range(self, vis_st, target_coord, test_time):
-        """Reported roll angles should be in [0, 360)."""
+        """Reported roll angles should be in [-180, 180]."""
         times = test_time + np.arange(97) * u.min
         result = vis_st.get_visibility_best_roll(target_coord, times)
         valid = np.isfinite(result["roll_deg"])
         if valid.any():
-            assert np.all(result["roll_deg"][valid] >= 0)
-            assert np.all(result["roll_deg"][valid] < 360)
+            assert np.all(result["roll_deg"][valid] >= -180)
+            assert np.all(result["roll_deg"][valid] <= 180)
 
     def test_nst_range(self, vis_st, target_coord, test_time):
         """n_st_pass should be 0, 1, or 2."""
@@ -1162,17 +1162,18 @@ class TestBestRoll:
                                       result["boresight_visible"])
 
     def test_agrees_with_fixed_roll(self, vis_st, target_coord, test_time):
-        """When best-roll says visible at roll R, a fixed-roll instance
-        at R should also say visible (boresight + ST)."""
+        """Round-trip: get_visibility_best_roll and get_visibility with the
+        chosen fixed roll must agree on every timestep in the orbit."""
         times = test_time + np.arange(97) * u.min
         result = vis_st.get_visibility_best_roll(target_coord, times, roll_step=5 * u.deg)
         vis_mask = result["visible"]
         if not vis_mask.any():
             pytest.skip("No visible steps for this target/epoch")
 
-        # Pick a visible time step and verify with a fixed-roll instance
-        idx = np.where(vis_mask)[0][0]
-        roll_val = result["roll_deg"][idx]
+        # All visible steps share the same roll (single orbit)
+        roll_val = result["roll_deg"][vis_mask][0]
+
+        # Build a fixed-roll Visibility with the orbit-optimal roll
         vis_fixed = Visibility(
             _BR_LINE1, _BR_LINE2,
             st_sun_min=44 * u.deg,
@@ -1180,7 +1181,22 @@ class TestBestRoll:
             st_moon_min=12 * u.deg,
             roll=roll_val * u.deg,
         )
-        assert vis_fixed.get_visibility(target_coord, times[idx])
+        fixed_vis = vis_fixed.get_visibility(target_coord, times)
+
+        # Every timestep best_roll marks visible must also be visible
+        # with the fixed-roll instance
+        assert np.all(fixed_vis[vis_mask]), (
+            f"best_roll says visible but fixed-roll disagrees at "
+            f"{np.where(vis_mask & ~fixed_vis)[0]}"
+        )
+        # And vice-versa: where boresight passes but best_roll says
+        # not-visible, fixed-roll should also say not-visible
+        bs_mask = result["boresight_visible"]
+        not_vis = bs_mask & ~vis_mask
+        assert not np.any(fixed_vis[not_vis]), (
+            f"fixed-roll says visible but best_roll disagrees at "
+            f"{np.where(not_vis & fixed_vis)[0]}"
+        )
 
     def test_coarser_step_still_works(self, vis_st, target_coord, test_time):
         """Coarser roll step should still return valid results (may find fewer)."""
