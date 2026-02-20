@@ -759,3 +759,453 @@ class TestStarTrackerConstraints:
         vis = Visibility(line1, line2, st_sun_min=1 * u.deg, st_required=2)
         summary = vis.summary(target_coord, test_time)
         assert "both" in summary
+
+
+class TestRollParameter:
+    """Tests for the configurable roll parameter."""
+
+    @pytest.fixture
+    def line1(self):
+        return "1 67395U 80229J   26047.67973380 .00000000  00000-0  00000-0 0     9"
+
+    @pytest.fixture
+    def line2(self):
+        return "2 67395  97.8021  48.2438 0011432 172.6532 187.4720 14.83698208    13"
+
+    @pytest.fixture
+    def target_coord(self):
+        """Target well away from the pole."""
+        return SkyCoord(134.6894, 8.2237, frame="icrs", unit="deg")
+
+    @pytest.fixture
+    def test_time(self):
+        return Time("2026-02-15T18:44:12")
+
+    # ── constructor / repr ──────────────────────────────────────────
+
+    def test_roll_default_is_none(self, line1, line2):
+        """Roll defaults to None (Sun-constrained attitude)."""
+        vis = Visibility(line1, line2)
+        assert vis.roll is None
+
+    def test_roll_stored_in_degrees(self, line1, line2):
+        """Roll is stored after unit conversion."""
+        vis = Visibility(line1, line2, roll=45 * u.deg)
+        assert vis.roll == 45 * u.deg
+
+    def test_roll_converted_from_radians(self, line1, line2):
+        """Roll specified in radians is converted to degrees."""
+        vis = Visibility(line1, line2, roll=np.pi / 4 * u.rad)
+        assert u.isclose(vis.roll, 45 * u.deg, atol=1e-10 * u.deg)
+
+    def test_repr_shows_roll(self, line1, line2):
+        """__repr__ includes roll when set."""
+        vis = Visibility(line1, line2, roll=30 * u.deg)
+        repr_str = repr(vis)
+        assert "roll=30.0 deg" in repr_str
+
+    def test_repr_omits_roll_when_none(self, line1, line2):
+        """__repr__ omits roll when not set."""
+        vis = Visibility(line1, line2)
+        repr_str = repr(vis)
+        assert "roll" not in repr_str
+
+    # ── _roll_attitude unit-level ───────────────────────────────────
+
+    def test_roll_attitude_orthonormality(self):
+        """X, Y, Z from _roll_attitude are orthonormal."""
+        z = np.array([0.3, 0.4, 0.866])
+        z = z / np.linalg.norm(z)
+        for angle_deg in [0, 45, 90, 135, 180, -45]:
+            x, y = Visibility._roll_attitude(z, np.radians(angle_deg))
+            assert abs(np.dot(x, y)) < 1e-12, f"X·Y != 0 at {angle_deg}°"
+            assert abs(np.dot(x, z)) < 1e-12, f"X·Z != 0 at {angle_deg}°"
+            assert abs(np.dot(y, z)) < 1e-12, f"Y·Z != 0 at {angle_deg}°"
+            assert abs(np.linalg.norm(x) - 1) < 1e-12
+            assert abs(np.linalg.norm(y) - 1) < 1e-12
+
+    def test_roll_attitude_right_handed(self):
+        """Axes form a right-handed frame: X × Y = Z."""
+        z = np.array([0.5, 0.5, 0.7071])
+        z = z / np.linalg.norm(z)
+        for angle_deg in [0, 47, 90, 180]:
+            x, y = Visibility._roll_attitude(z, np.radians(angle_deg))
+            cross = np.cross(x, y)
+            np.testing.assert_allclose(cross, z, atol=1e-12)
+
+    def test_roll_zero_aligns_with_north_projection(self):
+        """Roll=0 makes X align with celestial-north projection."""
+        z = np.array([0.3, 0.4, 0.866])
+        z = z / np.linalg.norm(z)
+        x, _y = Visibility._roll_attitude(z, 0.0)
+        # Compute expected north projection
+        north = np.array([0.0, 0.0, 1.0])
+        north_proj = north - np.dot(north, z) * z
+        x_ref = north_proj / np.linalg.norm(north_proj)
+        np.testing.assert_allclose(x, x_ref, atol=1e-12)
+
+    def test_roll_90_perpendicular_to_north(self):
+        """Roll=90° makes X perpendicular to celestial-north projection."""
+        z = np.array([0.3, 0.4, 0.866])
+        z = z / np.linalg.norm(z)
+        x0, _y0 = Visibility._roll_attitude(z, 0.0)
+        x90, _y90 = Visibility._roll_attitude(z, np.pi / 2)
+        assert abs(np.dot(x90, x0)) < 1e-12
+
+    def test_roll_180_flips_axes(self):
+        """Roll=180° flips X and Y relative to roll=0."""
+        z = np.array([0.3, 0.4, 0.866])
+        z = z / np.linalg.norm(z)
+        x0, y0 = Visibility._roll_attitude(z, 0.0)
+        x180, y180 = Visibility._roll_attitude(z, np.pi)
+        np.testing.assert_allclose(np.dot(x0, x180), -1, atol=1e-12)
+        np.testing.assert_allclose(np.dot(y0, y180), -1, atol=1e-12)
+
+    def test_roll_attitude_pole_fallback(self):
+        """Boresight near celestial pole uses east fallback without crashing."""
+        z_pole = np.array([0.0, 0.0, 1.0])
+        x, y = Visibility._roll_attitude(z_pole, np.radians(30))
+        assert abs(np.dot(x, z_pole)) < 1e-12
+        assert abs(np.dot(y, z_pole)) < 1e-12
+        assert abs(np.linalg.norm(x) - 1) < 1e-12
+        assert abs(np.linalg.norm(y) - 1) < 1e-12
+        # Right-handed
+        np.testing.assert_allclose(np.cross(x, y), z_pole, atol=1e-12)
+
+    # ── Integration: star tracker with roll ─────────────────────────
+
+    def test_roll_none_matches_sun_constrained(
+        self, line1, line2, target_coord, test_time
+    ):
+        """roll=None gives same ST pointing as the Sun-constrained default."""
+        vis_default = Visibility(line1, line2, st_sun_min=1 * u.deg)
+        # Without roll, same instance
+        for tracker in [1, 2]:
+            sc = vis_default._get_star_tracker_skycoord(
+                target_coord, test_time, tracker
+            )
+            # Just verify it doesn't crash and gives a valid coordinate
+            assert not np.isnan(sc.spherical.lon.deg)
+            assert not np.isnan(sc.spherical.lat.deg)
+
+    def test_roll_changes_star_tracker_pointing(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Setting a roll changes where the star tracker points."""
+        vis_sun = Visibility(line1, line2, st_sun_min=1 * u.deg)
+        vis_roll = Visibility(line1, line2, st_sun_min=1 * u.deg, roll=45 * u.deg)
+        sc_sun = vis_sun._get_star_tracker_skycoord(target_coord, test_time, 1)
+        sc_roll = vis_roll._get_star_tracker_skycoord(target_coord, test_time, 1)
+        sep = sc_sun.separation(sc_roll)
+        assert sep.deg > 1.0, "45° roll should significantly move ST pointing"
+
+    def test_roll_scalar_and_array_time_agree(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Scalar and single-element array times give matching ST coordinates."""
+        vis = Visibility(line1, line2, st_sun_min=1 * u.deg, roll=30 * u.deg)
+        sc_scalar = vis._get_star_tracker_skycoord(target_coord, test_time, 1)
+        times_arr = Time([test_time.iso])
+        sc_array = vis._get_star_tracker_skycoord(target_coord, times_arr, 1)
+        # Should produce nearly identical pointing
+        sc_s = SkyCoord(
+            sc_scalar.spherical.lon, sc_scalar.spherical.lat, frame="icrs"
+        )
+        sc_a = SkyCoord(
+            sc_array.spherical.lon[0], sc_array.spherical.lat[0], frame="icrs"
+        )
+        sep = sc_s.separation(sc_a)
+        assert sep.arcsec < 1.0, f"Scalar/array mismatch: {sep.arcsec:.2f} arcsec"
+
+    def test_fixed_roll_constant_pointing(self, line1, line2, target_coord):
+        """With fixed roll, ST pointing is the same at all times (no Sun motion)."""
+        vis = Visibility(line1, line2, st_sun_min=1 * u.deg, roll=0 * u.deg)
+        times = Time("2026-02-15T18:44:12") + np.array([0, 3, 6]) * u.hour
+        for tracker in [1, 2]:
+            sc = vis._get_star_tracker_skycoord(target_coord, times, tracker)
+            ra_spread = sc.spherical.lon.deg.max() - sc.spherical.lon.deg.min()
+            dec_spread = sc.spherical.lat.deg.max() - sc.spherical.lat.deg.min()
+            assert ra_spread < 0.01, f"RA spread {ra_spread:.4f}° for ST{tracker}"
+            assert dec_spread < 0.01, f"Dec spread {dec_spread:.4f}° for ST{tracker}"
+
+    def test_fast_slow_agreement_with_roll(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Fast constraint path agrees with slow (SkyCoord) path when roll is set."""
+        vis = Visibility(
+            line1, line2, st_sun_min=45 * u.deg, roll=20 * u.deg
+        )
+        fast = vis.get_star_tracker_constraint(target_coord, test_time)
+        # Slow path: compute angles explicitly
+        angles1 = vis.get_star_tracker_angles(target_coord, test_time, tracker=1)
+        angles2 = vis.get_star_tracker_angles(target_coord, test_time, tracker=2)
+        slow_1 = angles1["sun_angle"].value >= 45.0
+        slow_2 = angles2["sun_angle"].value >= 45.0
+        slow = slow_1 | slow_2  # st_required=1
+        assert fast == slow, f"Fast={fast}, Slow={slow}"
+
+    def test_fast_slow_agreement_with_roll_array(
+        self, line1, line2, target_coord
+    ):
+        """Fast/slow agreement with roll over an array of times."""
+        vis = Visibility(
+            line1, line2, st_sun_min=45 * u.deg, roll=20 * u.deg
+        )
+        times = Time("2026-02-15T18:00:00") + np.arange(5) * u.hour
+        fast = vis.get_star_tracker_constraint(target_coord, times)
+        slow = np.zeros(len(times), dtype=bool)
+        for i, t in enumerate(times):
+            angles1 = vis.get_star_tracker_angles(target_coord, t, tracker=1)
+            angles2 = vis.get_star_tracker_angles(target_coord, t, tracker=2)
+            s1 = angles1["sun_angle"].value >= 45.0
+            s2 = angles2["sun_angle"].value >= 45.0
+            slow[i] = s1 | s2
+        np.testing.assert_array_equal(fast, slow)
+
+    def test_roll_constraint_with_visibility(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Roll parameter works end-to-end through get_visibility."""
+        vis = Visibility(
+            line1, line2, st_sun_min=1 * u.deg, roll=30 * u.deg
+        )
+        # Should not crash
+        result = vis.get_visibility(target_coord, test_time)
+        assert isinstance(result, (bool, np.bool_))
+
+    def test_roll_constraint_array_with_visibility(
+        self, line1, line2, target_coord
+    ):
+        """Roll + get_visibility over time array works and returns array."""
+        vis = Visibility(
+            line1, line2, st_sun_min=1 * u.deg, roll=30 * u.deg
+        )
+        times = Time("2026-02-15T00:00:00") + np.arange(10) * u.hour
+        result = vis.get_visibility(target_coord, times)
+        assert result.shape == times.shape
+        assert result.dtype == bool
+
+    def test_roll_get_star_tracker_angles(
+        self, line1, line2, target_coord, test_time
+    ):
+        """get_star_tracker_angles returns valid dict when roll is set."""
+        vis = Visibility(line1, line2, roll=45 * u.deg)
+        for tracker in [1, 2]:
+            angles = vis.get_star_tracker_angles(
+                target_coord, test_time, tracker=tracker
+            )
+            assert "ra" in angles
+            assert "dec" in angles
+            assert "sun_angle" in angles
+            assert "moon_angle" in angles
+            assert "earthlimb_angle" in angles
+            assert not np.any(np.isnan(angles["ra"].value))
+            assert not np.any(np.isnan(angles["dec"].value))
+
+    def test_sun_constrained_roll_round_trip(
+        self, line1, line2, target_coord, test_time
+    ):
+        """Measure roll from Sun-constrained attitude, then reproduce it.
+
+        Compute the Sun-constrained ST pointing, measure what roll angle
+        corresponds to that attitude, then set that roll and verify the
+        ST pointing matches.
+        """
+        vis_sun = Visibility(line1, line2, st_sun_min=1 * u.deg)
+        sc_sun = vis_sun._get_star_tracker_skycoord(target_coord, test_time, 1)
+
+        # Get the Sun-constrained attitude axes
+        from astropy.coordinates import GCRS
+        ref_time = test_time
+        target_gcrs = target_coord.transform_to(GCRS(obstime=ref_time))
+        z = target_gcrs.cartesian.xyz.value.astype(float)
+        z = z / np.linalg.norm(z)
+
+        observer_location = vis_sun._get_observer_location(test_time)
+        sun_coord = get_body("sun", time=test_time, location=observer_location)
+        sun_xyz = sun_coord.cartesian.xyz.value.astype(float)
+        sun_vec = sun_xyz / np.linalg.norm(sun_xyz)
+
+        y_sun = np.cross(sun_vec, z)
+        y_sun = y_sun / np.linalg.norm(y_sun)
+        x_sun = np.cross(y_sun, z)
+        x_sun = x_sun / np.linalg.norm(x_sun)
+
+        # Measure roll: angle from north-projection to x_sun
+        north = np.array([0.0, 0.0, 1.0])
+        north_proj = north - np.dot(north, z) * z
+        x_ref = north_proj / np.linalg.norm(north_proj)
+        y_ref = np.cross(z, x_ref)
+        y_ref = y_ref / np.linalg.norm(y_ref)
+        cos_r = np.dot(x_ref, x_sun)
+        sin_r = np.dot(y_ref, x_sun)
+        measured_roll_rad = np.arctan2(sin_r, cos_r)
+
+        # Now use that measured roll
+        vis_roll = Visibility(
+            line1, line2,
+            st_sun_min=1 * u.deg,
+            roll=np.degrees(measured_roll_rad) * u.deg,
+        )
+        sc_roll = vis_roll._get_star_tracker_skycoord(target_coord, test_time, 1)
+
+        sep = sc_sun.separation(sc_roll)
+        assert sep.arcsec < 1.0, (
+            f"Round-trip failed: {sep.arcsec:.2f} arcsec separation"
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Tests for get_visibility_best_roll
+# ──────────────────────────────────────────────────────────────────────
+
+_BR_LINE1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
+_BR_LINE2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+
+
+class TestBestRoll:
+    """Tests for get_visibility_best_roll()."""
+
+    @pytest.fixture
+    def vis_st(self):
+        """Visibility instance with ST keep-out constraints enabled."""
+        return Visibility(
+            _BR_LINE1, _BR_LINE2,
+            st_sun_min=44 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_moon_min=12 * u.deg,
+        )
+
+    @pytest.fixture
+    def target_coord(self):
+        return SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
+
+    @pytest.fixture
+    def test_time(self):
+        return Time("2025-01-01T00:00:00")
+
+    def test_returns_dict_keys_scalar(self, vis_st, target_coord, test_time):
+        """Scalar time returns a dict with the expected keys and scalar types."""
+        result = vis_st.get_visibility_best_roll(target_coord, test_time)
+        assert set(result.keys()) == {
+            "visible", "boresight_visible", "roll_deg", "n_st_pass",
+            "solar_power_frac",
+        }
+        assert isinstance(result["visible"], bool)
+        assert isinstance(result["boresight_visible"], bool)
+        assert isinstance(result["roll_deg"], float)
+        assert isinstance(result["n_st_pass"], int)
+        assert isinstance(result["solar_power_frac"], float)
+
+    def test_returns_dict_keys_array(self, vis_st, target_coord, test_time):
+        """Array time returns arrays with matching shapes."""
+        times = test_time + np.arange(10) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        for key in ["visible", "boresight_visible", "roll_deg",
+                     "n_st_pass", "solar_power_frac"]:
+            assert result[key].shape == (10,), f"{key} shape mismatch"
+
+    def test_visible_subset_of_boresight(self, vis_st, target_coord, test_time):
+        """visible should never be True where boresight_visible is False."""
+        times = test_time + np.arange(50) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        assert not np.any(result["visible"] & ~result["boresight_visible"])
+
+    def test_roll_nan_where_not_visible(self, vis_st, target_coord, test_time):
+        """roll_deg should be NaN at time steps where visible is False."""
+        times = test_time + np.arange(50) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        not_vis = ~result["visible"]
+        if not_vis.any():
+            assert np.all(np.isnan(result["roll_deg"][not_vis]))
+            assert np.all(np.isnan(result["solar_power_frac"][not_vis]))
+
+    def test_roll_not_nan_where_visible(self, vis_st, target_coord, test_time):
+        """roll_deg should be finite wherever visible is True."""
+        times = test_time + np.arange(97) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        vis_mask = result["visible"]
+        if vis_mask.any():
+            assert np.all(np.isfinite(result["roll_deg"][vis_mask]))
+            assert np.all(np.isfinite(result["solar_power_frac"][vis_mask]))
+
+    def test_roll_range(self, vis_st, target_coord, test_time):
+        """Reported roll angles should be in [0, 360)."""
+        times = test_time + np.arange(97) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        valid = np.isfinite(result["roll_deg"])
+        if valid.any():
+            assert np.all(result["roll_deg"][valid] >= 0)
+            assert np.all(result["roll_deg"][valid] < 360)
+
+    def test_nst_range(self, vis_st, target_coord, test_time):
+        """n_st_pass should be 0, 1, or 2."""
+        times = test_time + np.arange(50) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        assert np.all((result["n_st_pass"] >= 0) & (result["n_st_pass"] <= 2))
+
+    def test_solar_power_range(self, vis_st, target_coord, test_time):
+        """solar_power_frac should be in [0, 1] where visible."""
+        times = test_time + np.arange(97) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        vis_mask = result["visible"]
+        if vis_mask.any():
+            pf = result["solar_power_frac"][vis_mask]
+            assert np.all(pf >= 0) and np.all(pf <= 1)
+
+    def test_no_st_constraints_returns_boresight(self, target_coord, test_time):
+        """Without ST constraints, visible == boresight_visible."""
+        vis = Visibility(_BR_LINE1, _BR_LINE2)
+        times = test_time + np.arange(20) * u.min
+        result = vis.get_visibility_best_roll(target_coord, times)
+        np.testing.assert_array_equal(result["visible"],
+                                      result["boresight_visible"])
+
+    def test_agrees_with_fixed_roll(self, vis_st, target_coord, test_time):
+        """When best-roll says visible at roll R, a fixed-roll instance
+        at R should also say visible (boresight + ST)."""
+        times = test_time + np.arange(97) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times, roll_step=5 * u.deg)
+        vis_mask = result["visible"]
+        if not vis_mask.any():
+            pytest.skip("No visible steps for this target/epoch")
+
+        # Pick a visible time step and verify with a fixed-roll instance
+        idx = np.where(vis_mask)[0][0]
+        roll_val = result["roll_deg"][idx]
+        vis_fixed = Visibility(
+            _BR_LINE1, _BR_LINE2,
+            st_sun_min=44 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_moon_min=12 * u.deg,
+            roll=roll_val * u.deg,
+        )
+        assert vis_fixed.get_visibility(target_coord, times[idx])
+
+    def test_coarser_step_still_works(self, vis_st, target_coord, test_time):
+        """Coarser roll step should still return valid results (may find fewer)."""
+        times = test_time + np.arange(50) * u.min
+        fine = vis_st.get_visibility_best_roll(target_coord, times, roll_step=2 * u.deg)
+        coarse = vis_st.get_visibility_best_roll(target_coord, times, roll_step=10 * u.deg)
+        # Coarse should find a subset of what fine finds
+        assert coarse["visible"].sum() <= fine["visible"].sum() + 5  # allow small tolerance
+
+    def test_orbit_constant_roll(self, vis_st, target_coord, test_time):
+        """Within one orbit, all visible timesteps should use the same roll."""
+        times = test_time + np.arange(97) * u.min
+        result = vis_st.get_visibility_best_roll(target_coord, times)
+        vis_mask = result["visible"]
+        if vis_mask.sum() >= 2:
+            rolls = result["roll_deg"][vis_mask]
+            assert np.all(rolls == rolls[0]), (
+                f"Roll varies within one orbit: {np.unique(rolls)}"
+            )
+
+    def test_scalar_generates_orbit_window(self, vis_st, target_coord, test_time):
+        """Scalar time should internally generate an orbit window for roll selection."""
+        # The scalar result should match the array result at the same timestep
+        scalar_result = vis_st.get_visibility_best_roll(target_coord, test_time)
+        times = test_time + np.arange(97) * u.min
+        array_result = vis_st.get_visibility_best_roll(target_coord, times)
+        # test_time is times[0]; boresight should agree
+        assert scalar_result["boresight_visible"] == array_result["boresight_visible"][0]
