@@ -518,7 +518,7 @@ class Visibility:
     # Public API
     # ------------------------------------------------------------------
 
-    def get_visibility(self, target_coord: SkyCoord, time: Time):
+    def get_visibility(self, target_coord: SkyCoord, time: Time, roll=None):
         """
         Calculate whether the target is visible based on all constraints.
 
@@ -530,6 +530,11 @@ class Visibility:
             of results is returned.
         time : astropy.time.Time
             The time at which to calculate the constraint. Can be scalar or array.
+        roll : Quantity, optional
+            Spacecraft roll angle about boresight.  Overrides the instance
+            ``roll`` for this call only.  ``None`` (default) keeps the
+            instance value (which itself defaults to Sun-constrained when
+            not set at construction time).
 
         Returns:
         --------
@@ -540,6 +545,17 @@ class Visibility:
             - N coords (list or array) + scalar time → np.ndarray of bool, shape (N,)
             - N coords (list or array) + array time (M,) → np.ndarray of bool, shape (N, M)
         """
+        # Optionally override instance roll for this call
+        saved_roll = self.roll
+        if roll is not None:
+            self.roll = roll.to(u.deg)
+        try:
+            return self._get_visibility_inner(target_coord, time)
+        finally:
+            self.roll = saved_roll
+
+    def _get_visibility_inner(self, target_coord: SkyCoord, time: Time):
+        """Core visibility logic (called by get_visibility after roll override)."""
         # Precompute satellite state and body positions once for all targets
         pre = self._precompute(time)
 
