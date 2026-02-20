@@ -10,6 +10,34 @@ __all__ = ["Visibility"]
 _R_EARTH_M = R_earth.to(u.m).value
 
 
+def _validate_angle(value, name):
+    """Raise TypeError if *value* is not an astropy angular Quantity."""
+    if not isinstance(value, u.Quantity):
+        raise TypeError(
+            f"{name} must be an astropy Quantity with angular units "
+            f"(e.g. {name}={value}*u.deg), got {type(value).__name__}"
+        )
+    if not value.unit.physical_type == "angle":
+        raise u.UnitsError(
+            f"{name} must have angular units (e.g. u.deg), "
+            f"got {value.unit}"
+        )
+
+
+def _validate_time_quantity(value, name):
+    """Raise TypeError if *value* is not an astropy time Quantity."""
+    if not isinstance(value, u.Quantity):
+        raise TypeError(
+            f"{name} must be an astropy Quantity with time units "
+            f"(e.g. {name}={value}*u.min), got {type(value).__name__}"
+        )
+    if not value.unit.physical_type == "time":
+        raise u.UnitsError(
+            f"{name} must have time units (e.g. u.min), "
+            f"got {value.unit}"
+        )
+
+
 class Visibility:
     """
     A class to handle Two-Line Element (TLE) data and target visibility.
@@ -85,6 +113,17 @@ class Visibility:
             self.tle = Satrec.twoline2rv(line1, line2)
         except Exception as e:
             raise ValueError(f"Invalid TLE data: {e}")
+
+        # Validate units on any user-supplied angle parameters
+        _angle_params = [
+            "moon_min", "sun_min", "earthlimb_min", "mars_min",
+            "jupiter_min", "st_sun_min", "st_moon_min",
+            "st_earthlimb_min", "st1_earthlimb_min", "st2_earthlimb_min",
+            "roll",
+        ]
+        for key in _angle_params:
+            if key in custom_limits and custom_limits[key] is not None:
+                _validate_angle(custom_limits[key], key)
 
         # Set instance limits (use class defaults if not provided)
         self.moon_min = custom_limits.get("moon_min", self.MOON_MIN)
@@ -548,6 +587,7 @@ class Visibility:
         # Optionally override instance roll for this call
         saved_roll = self.roll
         if roll is not None:
+            _validate_angle(roll, "roll")
             self.roll = roll.to(u.deg)
         try:
             return self._get_visibility_inner(target_coord, time)
@@ -632,6 +672,9 @@ class Visibility:
         >>> print(result['visible'].sum(), "visible time steps")
         >>> print("Roll angles used:", result['roll_deg'])
         """
+        _validate_angle(roll_step, "roll_step")
+        _validate_time_quantity(orbit_time_step, "orbit_time_step")
+
         period = self.get_period()
         is_scalar = time.isscalar
         if is_scalar:
