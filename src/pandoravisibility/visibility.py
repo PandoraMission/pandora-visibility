@@ -411,13 +411,20 @@ class Visibility:
         zenith_unit = pre["zenith_unit"]
         limb_rad = pre["limb_angle_rad"]
 
-        # Target direction unit vector in epoch-matched GCRS
-        ref_time = time if time.isscalar else time[0]
-        tgt_xyz = target_coord.transform_to(GCRS(obstime=ref_time)).cartesian.xyz.value
-        tgt_unit = tgt_xyz / np.linalg.norm(tgt_xyz)  # (3,)
+        # Target direction unit vector(s) in GCRS at each observation time.
+        # Using obstime=time (not just time[0]) ensures aberration and
+        # precession are correctly evaluated for long time arrays.
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=time))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
 
-        # Broadcast for array time: (3,) → (3, 1)
-        tgt_b = tgt_unit[:, np.newaxis] if not time.isscalar else tgt_unit
+        if time.isscalar:
+            tgt_unit = tgt_xyz / np.linalg.norm(tgt_xyz)  # (3,)
+            tgt_b = tgt_unit
+        else:
+            tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)  # (3, N)
+            # Representative direction for attitude computation in ST
+            # constraints (aberration shift <0.02"/yr is negligible there)
+            tgt_unit = tgt_b[:, 0].copy()
 
         # Boresight body constraints via fast dot-product separation
         moon_deg = self.moon_min.to(u.deg).value
@@ -681,13 +688,13 @@ class Visibility:
             time = Time([time])
         N_input = len(time)
 
-        # Target direction in GCRS
-        ref_time = time[0]
-        tgt_xyz = target_coord.transform_to(
-            GCRS(obstime=ref_time)
-        ).cartesian.xyz.value
-        tgt_unit = tgt_xyz / np.linalg.norm(tgt_xyz)
-        tgt_b = tgt_unit[:, np.newaxis]  # (3, 1) for broadcasting
+        # Per-timestep target direction in GCRS (accounts for aberration
+        # and precession over long time arrays).
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=time))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b_all = tgt_xyz / np.linalg.norm(
+            tgt_xyz, axis=0, keepdims=True
+        )  # (3, N_input)
 
         # Roll setup
         step_deg = roll_step.to(u.deg).value
@@ -711,27 +718,27 @@ class Visibility:
             pre = self._precompute(time)
             bu = pre["body_units"]
             bs = (
-                self._fast_sep_deg(bu["moon"], tgt_b)
+                self._fast_sep_deg(bu["moon"], tgt_b_all)
                 >= self.moon_min.to(u.deg).value
             )
             bs &= (
-                self._fast_sep_deg(bu["sun"], tgt_b)
+                self._fast_sep_deg(bu["sun"], tgt_b_all)
                 >= self.sun_min.to(u.deg).value
             )
             bs &= (
                 self._fast_limb_deg(
-                    tgt_b, pre["zenith_unit"], pre["limb_angle_rad"]
+                    tgt_b_all, pre["zenith_unit"], pre["limb_angle_rad"]
                 )
                 >= self.earthlimb_min.to(u.deg).value
             )
             if self.mars_min > 0 * u.deg:
                 bs &= (
-                    self._fast_sep_deg(bu["mars"], tgt_b)
+                    self._fast_sep_deg(bu["mars"], tgt_b_all)
                     >= self.mars_min.to(u.deg).value
                 )
             if self.jupiter_min > 0 * u.deg:
                 bs &= (
-                    self._fast_sep_deg(bu["jupiter"], tgt_b)
+                    self._fast_sep_deg(bu["jupiter"], tgt_b_all)
                     >= self.jupiter_min.to(u.deg).value
                 )
             bs = np.asarray(bs).ravel()
@@ -772,6 +779,18 @@ class Visibility:
             center = Time(
                 (chunk_jd.min() + chunk_jd.max()) / 2, format="jd"
             )
+
+            # Per-orbit representative target direction at orbit center.
+            # Aberration shift within one orbit (~97 min) is <0.1",
+            # so a single direction is fine for the roll sweep and
+            # orbit-sample boresight constraints.
+            tgt_gcrs_orb = target_coord.transform_to(GCRS(obstime=center))
+            tgt_xyz_orb = tgt_gcrs_orb.cartesian.xyz.value
+            tgt_unit = tgt_xyz_orb / np.linalg.norm(tgt_xyz_orb)
+            tgt_b = tgt_unit[:, np.newaxis]  # (3, 1) for orbit sampling
+
+            # Per-timestep target directions for input boresight checks
+            chunk_tgt_b = tgt_b_all[:, idx]  # (3, N_chunk)
 
             # ── Find best roll from orbit window ──────────────────
             orbit_times = center + np.linspace(
@@ -921,27 +940,27 @@ class Visibility:
             limb_inp = pre_inp["limb_angle_rad"]
             N_chunk = len(chunk_times)
 
-            # Boresight at input times
+            # Boresight at input times (per-timestep target direction)
             bs_inp = (
-                self._fast_sep_deg(bu_inp["moon"], tgt_b)
+                self._fast_sep_deg(bu_inp["moon"], chunk_tgt_b)
                 >= self.moon_min.to(u.deg).value
             )
             bs_inp &= (
-                self._fast_sep_deg(bu_inp["sun"], tgt_b)
+                self._fast_sep_deg(bu_inp["sun"], chunk_tgt_b)
                 >= self.sun_min.to(u.deg).value
             )
             bs_inp &= (
-                self._fast_limb_deg(tgt_b, zen_inp, limb_inp)
+                self._fast_limb_deg(chunk_tgt_b, zen_inp, limb_inp)
                 >= self.earthlimb_min.to(u.deg).value
             )
             if self.mars_min > 0 * u.deg:
                 bs_inp &= (
-                    self._fast_sep_deg(bu_inp["mars"], tgt_b)
+                    self._fast_sep_deg(bu_inp["mars"], chunk_tgt_b)
                     >= self.mars_min.to(u.deg).value
                 )
             if self.jupiter_min > 0 * u.deg:
                 bs_inp &= (
-                    self._fast_sep_deg(bu_inp["jupiter"], tgt_b)
+                    self._fast_sep_deg(bu_inp["jupiter"], chunk_tgt_b)
                     >= self.jupiter_min.to(u.deg).value
                 )
             bs_inp = np.asarray(bs_inp).ravel()
@@ -1307,30 +1326,38 @@ class Visibility:
             obsgeovel=obs_gcrs.velocity.d_xyz,
         )
 
-        # Target direction unit vector in epoch-matched GCRS
-        ref_time = time if time.isscalar else time[0]
-        target_gcrs = target_coord.transform_to(GCRS(obstime=ref_time))
-        z_payload = target_gcrs.cartesian.xyz.value
-        z_payload = z_payload / np.linalg.norm(z_payload)
+        # Target direction unit vector(s) in GCRS at each observation time.
+        # Using obstime=time (not just time[0]) correctly accounts for
+        # aberration and precession over long time arrays.
+        target_gcrs = target_coord.transform_to(GCRS(obstime=time))
+        z_payload_raw = target_gcrs.cartesian.xyz.value
+
+        if time.isscalar:
+            z_payload = z_payload_raw / np.linalg.norm(z_payload_raw)
+        else:
+            z_payload = z_payload_raw / np.linalg.norm(
+                z_payload_raw, axis=0, keepdims=True
+            )  # (3, N)
 
         st_body = np.array(self._get_star_tracker_body_xyz(tracker))
 
         if self.roll is not None:
-            # Fixed-roll attitude: no Sun dependency
+            # Fixed-roll attitude: no Sun dependency.
+            # Use representative direction for attitude frame; the
+            # per-timestep z_payload is used for the final rotation.
             roll_rad = self.roll.to(u.rad).value
-            x_payload, y_payload = self._roll_attitude(z_payload, roll_rad)
+            z_rep = z_payload if time.isscalar else z_payload[:, 0]
+            x_payload, y_payload = self._roll_attitude(z_rep, roll_rad)
 
             if time.isscalar:
                 R = np.column_stack([x_payload, y_payload, z_payload])
                 st_eci = R @ st_body
                 st_eci = st_eci / np.linalg.norm(st_eci)
             else:
-                N = len(time)
-                z_col = np.tile(z_payload.reshape(3, 1), (1, N))
                 st_eci = (
                     x_payload[:, np.newaxis] * st_body[0]
                     + y_payload[:, np.newaxis] * st_body[1]
-                    + z_col * st_body[2]
+                    + z_payload * st_body[2]
                 )
                 st_eci = st_eci / np.linalg.norm(st_eci, axis=0, keepdims=True)
 
@@ -1371,8 +1398,7 @@ class Visibility:
         else:
             # Array case: sun_xyz shape is (3, N)
             sun_vec = sun_xyz / np.linalg.norm(sun_xyz, axis=0, keepdims=True)
-            N = len(time)
-            z_payload = np.tile(z_payload.reshape(3, 1), (1, N))
+            # z_payload is already (3, N) from per-timestep GCRS transform
 
             y_payload = np.cross(sun_vec, z_payload, axis=0)
             y_norms = np.linalg.norm(y_payload, axis=0, keepdims=True)
