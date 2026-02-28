@@ -1225,3 +1225,227 @@ class TestBestRoll:
         array_result = vis_st.get_visibility_best_roll(target_coord, times)
         # test_time is times[0]; boresight should agree
         assert scalar_result["boresight_visible"] == array_result["boresight_visible"][0]
+
+
+class TestEarthlimbDayNight:
+    """Tests for earthlimb_day_min / earthlimb_night_min parameters."""
+
+    @pytest.fixture
+    def line1(self):
+        return "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
+
+    @pytest.fixture
+    def line2(self):
+        return "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+
+    @pytest.fixture
+    def target_coord(self):
+        return SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
+
+    @pytest.fixture
+    def test_time(self):
+        return Time("2025-01-01T00:00:00")
+
+    # ── Defaults & storage ──────────────────────────────────────────
+
+    def test_defaults_are_none(self, line1, line2):
+        """earthlimb_day_min and night_min default to None."""
+        vis = Visibility(line1, line2)
+        assert vis.earthlimb_day_min is None
+        assert vis.earthlimb_night_min is None
+
+    def test_custom_values_stored(self, line1, line2):
+        """Custom day/night values are stored on the instance."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=10 * u.deg,
+        )
+        assert vis.earthlimb_day_min == 25 * u.deg
+        assert vis.earthlimb_night_min == 10 * u.deg
+
+    def test_angle_validation(self, line1, line2):
+        """Bare float without unit raises TypeError."""
+        with pytest.raises(TypeError, match="astropy Quantity"):
+            Visibility(line1, line2, earthlimb_day_min=25)
+        with pytest.raises(TypeError, match="astropy Quantity"):
+            Visibility(line1, line2, earthlimb_night_min=10)
+
+    # ── Backward compatibility ──────────────────────────────────────
+
+    def test_backward_compatible_when_none(self, line1, line2, target_coord, test_time):
+        """When both day/night are None, result is identical to earthlimb_min."""
+        vis_default = Visibility(line1, line2)
+        vis_explicit = Visibility(line1, line2, earthlimb_min=20 * u.deg)
+        times = test_time + np.arange(10) * u.min
+
+        r1 = vis_default.get_visibility(target_coord, times)
+        r2 = vis_explicit.get_visibility(target_coord, times)
+        np.testing.assert_array_equal(r1, r2)
+
+    # ── _earthlimb_is_sunlit unit test ──────────────────────────────
+
+    def test_earthlimb_is_sunlit_synthetic(self):
+        """Test sunlit detection with known geometry."""
+        # Target is in +X, zenith is +Z → limb point is in +X direction
+        target = np.array([1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+
+        # Sun in +X → dot(limb_dir, sun) > 0 → sunlit
+        sun_lit = np.array([1.0, 0.0, 0.0])
+        assert Visibility._earthlimb_is_sunlit(target, zenith, sun_lit) is True or \
+            bool(Visibility._earthlimb_is_sunlit(target, zenith, sun_lit)) is True
+
+        # Sun in -X → dot(limb_dir, sun) < 0 → dark
+        sun_dark = np.array([-1.0, 0.0, 0.0])
+        assert bool(Visibility._earthlimb_is_sunlit(target, zenith, sun_dark)) is False
+
+    def test_earthlimb_is_sunlit_array(self):
+        """Test sunlit detection with array inputs."""
+        target = np.array([[1.0, 1.0], [0.0, 0.0], [0.0, 0.0]])
+        zenith = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]])
+        # First timestep: sun in +X (sunlit), second: sun in -X (dark)
+        sun = np.array([[1.0, -1.0], [0.0, 0.0], [0.0, 0.0]])
+
+        result = Visibility._earthlimb_is_sunlit(target, zenith, sun)
+        assert result[0] is True or bool(result[0]) is True
+        assert bool(result[1]) is False
+
+    # ── __repr__ ────────────────────────────────────────────────────
+
+    def test_repr_shows_day_night(self, line1, line2):
+        """repr shows limb_day and limb_night when set."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=10 * u.deg,
+        )
+        r = repr(vis)
+        assert "limb_day≥" in r
+        assert "limb_night≥" in r
+        assert "25 deg" in r
+        assert "10 deg" in r
+
+    def test_repr_no_day_night_when_none(self, line1, line2):
+        """repr shows plain limb≥ when day/night are both None."""
+        vis = Visibility(line1, line2)
+        r = repr(vis)
+        assert "limb≥" in r
+        assert "limb_day" not in r
+        assert "limb_night" not in r
+
+    # ── Integration with get_visibility ─────────────────────────────
+
+    def test_day_limit_stricter_affects_visibility(self, line1, line2, target_coord):
+        """Setting earthlimb_day_min very high should reduce visibility
+        compared to default when the nearest limb is sunlit."""
+        times = Time("2025-01-01T00:00:00") + np.arange(100) * u.min
+        vis_default = Visibility(line1, line2)
+        vis_strict_day = Visibility(
+            line1, line2,
+            earthlimb_day_min=90 * u.deg,
+            earthlimb_night_min=20 * u.deg,
+        )
+        r_default = np.asarray(vis_default.get_visibility(target_coord, times))
+        r_strict = np.asarray(vis_strict_day.get_visibility(target_coord, times))
+        # Strict day should be same or fewer visible timesteps
+        assert r_strict.sum() <= r_default.sum()
+
+    def test_night_limit_stricter_affects_visibility(self, line1, line2, target_coord):
+        """Setting earthlimb_night_min very high should reduce visibility
+        compared to default when the nearest limb is in shadow."""
+        times = Time("2025-01-01T00:00:00") + np.arange(100) * u.min
+        vis_default = Visibility(line1, line2)
+        vis_strict_night = Visibility(
+            line1, line2,
+            earthlimb_day_min=20 * u.deg,
+            earthlimb_night_min=90 * u.deg,
+        )
+        r_default = np.asarray(vis_default.get_visibility(target_coord, times))
+        r_strict = np.asarray(vis_strict_night.get_visibility(target_coord, times))
+        assert r_strict.sum() <= r_default.sum()
+
+    def test_loose_both_more_permissive(self, line1, line2, target_coord):
+        """Setting both day/night to 0 should give >= visibility vs default."""
+        times = Time("2025-01-01T00:00:00") + np.arange(100) * u.min
+        vis_default = Visibility(line1, line2)
+        vis_loose = Visibility(
+            line1, line2,
+            earthlimb_day_min=0 * u.deg,
+            earthlimb_night_min=0 * u.deg,
+        )
+        r_default = np.asarray(vis_default.get_visibility(target_coord, times))
+        r_loose = np.asarray(vis_loose.get_visibility(target_coord, times))
+        assert r_loose.sum() >= r_default.sum()
+
+    # ── get_constraint ──────────────────────────────────────────────
+
+    def test_get_constraint_uses_day_night(self, line1, line2, target_coord, test_time):
+        """get_constraint('earthlimb', ...) returns bool with day/night."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=10 * u.deg,
+        )
+        result = vis.get_constraint(target_coord, "earthlimb", test_time)
+        assert isinstance(result, (bool, np.bool_))
+
+    # ── summary ─────────────────────────────────────────────────────
+
+    def test_summary_shows_day_or_night(self, line1, line2, target_coord, test_time):
+        """Summary should indicate [day] or [night] for earthlimb."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=10 * u.deg,
+        )
+        summary = vis.summary(target_coord, test_time)
+        assert "[day]" in summary or "[night]" in summary
+
+    # ── Fallback behavior ───────────────────────────────────────────
+
+    def test_only_day_set_falls_back_to_earthlimb_min(self, line1, line2):
+        """When only day is set, night falls back to earthlimb_min."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=30 * u.deg,
+        )
+        assert vis.earthlimb_day_min == 30 * u.deg
+        assert vis.earthlimb_night_min is None
+        # Night threshold should use earthlimb_min (20 deg default)
+        # Verify via _effective_earthlimb_min_deg with a dark limb
+        target = np.array([1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        sun_dark = np.array([-1.0, 0.0, 0.0])
+        eff = vis._effective_earthlimb_min_deg(target, zenith, sun_dark)
+        assert float(eff) == pytest.approx(20.0)  # falls back to earthlimb_min
+
+    def test_only_night_set_falls_back_to_earthlimb_min(self, line1, line2):
+        """When only night is set, day falls back to earthlimb_min."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_night_min=5 * u.deg,
+        )
+        assert vis.earthlimb_night_min == 5 * u.deg
+        assert vis.earthlimb_day_min is None
+        # Day threshold should use earthlimb_min
+        target = np.array([1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        sun_lit = np.array([1.0, 0.0, 0.0])
+        eff = vis._effective_earthlimb_min_deg(target, zenith, sun_lit)
+        assert float(eff) == pytest.approx(20.0)
+
+    # ── Array time ──────────────────────────────────────────────────
+
+    def test_array_time_different_thresholds(self, line1, line2, target_coord):
+        """Over an array of times, day/night thresholds vary per timestep."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=5 * u.deg,
+        )
+        times = Time("2025-01-01T00:00:00") + np.arange(100) * u.min
+        result = vis.get_visibility(target_coord, times)
+        assert isinstance(result, np.ndarray)
+        assert result.shape == times.shape
+        assert result.dtype == bool

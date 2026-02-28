@@ -81,6 +81,8 @@ class Visibility:
     MOON_MIN = 25 * u.deg
     SUN_MIN = 91 * u.deg
     EARTHLIMB_MIN = 20 * u.deg
+    EARTHLIMB_DAY_MIN = None    # None = use EARTHLIMB_MIN
+    EARTHLIMB_NIGHT_MIN = None  # None = use EARTHLIMB_MIN
     MARS_MIN = 0 * u.deg
     JUPITER_MIN = 0 * u.deg
 
@@ -116,7 +118,9 @@ class Visibility:
 
         # Validate units on any user-supplied angle parameters
         _angle_params = [
-            "moon_min", "sun_min", "earthlimb_min", "mars_min",
+            "moon_min", "sun_min", "earthlimb_min",
+            "earthlimb_day_min", "earthlimb_night_min",
+            "mars_min",
             "jupiter_min", "st_sun_min", "st_moon_min",
             "st_earthlimb_min", "st1_earthlimb_min", "st2_earthlimb_min",
             "roll",
@@ -129,6 +133,12 @@ class Visibility:
         self.moon_min = custom_limits.get("moon_min", self.MOON_MIN)
         self.sun_min = custom_limits.get("sun_min", self.SUN_MIN)
         self.earthlimb_min = custom_limits.get("earthlimb_min", self.EARTHLIMB_MIN)
+        self.earthlimb_day_min = custom_limits.get(
+            "earthlimb_day_min", self.EARTHLIMB_DAY_MIN
+        )
+        self.earthlimb_night_min = custom_limits.get(
+            "earthlimb_night_min", self.EARTHLIMB_NIGHT_MIN
+        )
         self.mars_min = custom_limits.get("mars_min", self.MARS_MIN)
         self.jupiter_min = custom_limits.get("jupiter_min", self.JUPITER_MIN)
 
@@ -161,7 +171,12 @@ class Visibility:
             constraints.append(f"moon≥{self.moon_min:.0f}")
         if self.sun_min > 0 * u.deg:
             constraints.append(f"sun≥{self.sun_min:.0f}")
-        if self.earthlimb_min > 0 * u.deg:
+        if self.earthlimb_day_min is not None or self.earthlimb_night_min is not None:
+            day_lim = self.earthlimb_day_min if self.earthlimb_day_min is not None else self.earthlimb_min
+            night_lim = self.earthlimb_night_min if self.earthlimb_night_min is not None else self.earthlimb_min
+            constraints.append(f"limb_day≥{day_lim:.0f}")
+            constraints.append(f"limb_night≥{night_lim:.0f}")
+        elif self.earthlimb_min > 0 * u.deg:
             constraints.append(f"limb≥{self.earthlimb_min:.0f}")
         if self.mars_min > 0 * u.deg:
             constraints.append(f"mars≥{self.mars_min:.0f}")
@@ -298,10 +313,33 @@ class Visibility:
 
         elif body == "earthlimb":
             # Calculate angular distance from the Earth's limb
-            return (
-                self._get_angle_from_earth_limb(observer_location, target_coord, time)
-                >= min_angle
+            limb_angle = self._get_angle_from_earth_limb(
+                observer_location, target_coord, time
             )
+            # Day/night-aware threshold
+            if self.earthlimb_day_min is not None or self.earthlimb_night_min is not None:
+                obs_gcrs = observer_location.get_gcrs(obstime=time)
+                obs_xyz = obs_gcrs.cartesian.xyz.to(u.m).value
+                if time.isscalar:
+                    zenith_u = obs_xyz / np.linalg.norm(obs_xyz)
+                else:
+                    zenith_u = obs_xyz / np.linalg.norm(obs_xyz, axis=0, keepdims=True)
+                tgt_gcrs = target_coord.transform_to(GCRS(obstime=time))
+                tgt_xyz = tgt_gcrs.cartesian.xyz.value
+                if time.isscalar:
+                    tgt_u = tgt_xyz / np.linalg.norm(tgt_xyz)
+                else:
+                    tgt_u = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+                sun_body = get_body("sun", time=time, location=observer_location)
+                sun_xyz = sun_body.cartesian.xyz.value
+                if time.isscalar:
+                    sun_u = sun_xyz / np.linalg.norm(sun_xyz)
+                else:
+                    sun_u = sun_xyz / np.linalg.norm(sun_xyz, axis=0, keepdims=True)
+                min_angle = self._effective_earthlimb_min_deg(
+                    tgt_u, zenith_u, sun_u
+                ) * u.deg
+            return limb_angle >= min_angle
 
     def _get_observer_location(self, time: Time) -> EarthLocation:
         """Helper method to get observer location without side effects."""
@@ -342,6 +380,63 @@ class Visibility:
         dot = np.sum(target_unit * zenith_unit, axis=0)
         elev = np.arcsin(np.clip(dot, -1.0, 1.0))
         return np.rad2deg(elev + limb_angle_rad)
+
+    @staticmethod
+    def _earthlimb_is_sunlit(target_unit, zenith_unit, sun_unit):
+        """Whether the nearest Earth limb point to the target is sunlit.
+
+        Projects the target direction onto the plane perpendicular to
+        the zenith (observer-to-Earth-center axis), giving the direction
+        from Earth's center to the nearest limb point.  The limb point
+        is considered sunlit when ``dot(limb_dir, sun_dir) > 0``.
+
+        Parameters
+        ----------
+        target_unit : ndarray, shape (3,) or (3, N)
+            Target direction unit vector(s) in GCRS.
+        zenith_unit : ndarray, shape (3,) or (3, N)
+            Observer zenith direction unit vector(s).
+        sun_unit : ndarray, shape (3,) or (3, N)
+            Sun direction unit vector(s).
+
+        Returns
+        -------
+        bool or ndarray of bool
+            True where the nearest limb point is sunlit.
+        """
+        dot_tz = np.sum(target_unit * zenith_unit, axis=0)
+        if target_unit.ndim == 1:
+            proj = target_unit - zenith_unit * dot_tz
+        else:
+            proj = target_unit - zenith_unit * dot_tz[np.newaxis, :]
+        proj_norm = np.linalg.norm(proj, axis=0, keepdims=True)
+        limb_unit = proj / np.where(proj_norm < 1e-12, 1.0, proj_norm)
+        return np.sum(limb_unit * sun_unit, axis=0) > 0
+
+    def _effective_earthlimb_min_deg(self, target_unit, zenith_unit, sun_unit):
+        """Per-timestep effective Earth limb threshold in degrees.
+
+        When ``earthlimb_day_min`` or ``earthlimb_night_min`` is set,
+        returns a scalar or array of thresholds that depend on whether
+        the nearest limb point is sunlit.  Otherwise returns a plain
+        scalar from ``earthlimb_min``.
+        """
+        if self.earthlimb_day_min is None and self.earthlimb_night_min is None:
+            return self.earthlimb_min.to(u.deg).value
+
+        day_deg = (
+            self.earthlimb_day_min.to(u.deg).value
+            if self.earthlimb_day_min is not None
+            else self.earthlimb_min.to(u.deg).value
+        )
+        night_deg = (
+            self.earthlimb_night_min.to(u.deg).value
+            if self.earthlimb_night_min is not None
+            else self.earthlimb_min.to(u.deg).value
+        )
+
+        sunlit = self._earthlimb_is_sunlit(target_unit, zenith_unit, sun_unit)
+        return np.where(sunlit, day_deg, night_deg)
 
     def _precompute(self, time: Time) -> dict:
         """Precompute time-dependent quantities shared across targets.
@@ -429,11 +524,13 @@ class Visibility:
         # Boresight body constraints via fast dot-product separation
         moon_deg = self.moon_min.to(u.deg).value
         sun_deg = self.sun_min.to(u.deg).value
-        limb_deg = self.earthlimb_min.to(u.deg).value
+        limb_threshold = self._effective_earthlimb_min_deg(
+            tgt_b, zenith_unit, body_units["sun"]
+        )
 
         result = self._fast_sep_deg(body_units["moon"], tgt_b) >= moon_deg
         result &= self._fast_sep_deg(body_units["sun"], tgt_b) >= sun_deg
-        result &= self._fast_limb_deg(tgt_b, zenith_unit, limb_rad) >= limb_deg
+        result &= self._fast_limb_deg(tgt_b, zenith_unit, limb_rad) >= limb_threshold
 
         if self.mars_min > 0 * u.deg:
             result &= (
@@ -729,7 +826,9 @@ class Visibility:
                 self._fast_limb_deg(
                     tgt_b_all, pre["zenith_unit"], pre["limb_angle_rad"]
                 )
-                >= self.earthlimb_min.to(u.deg).value
+                >= self._effective_earthlimb_min_deg(
+                    tgt_b_all, pre["zenith_unit"], bu["sun"]
+                )
             )
             if self.mars_min > 0 * u.deg:
                 bs &= (
@@ -812,7 +911,9 @@ class Visibility:
             )
             bs_orb &= (
                 self._fast_limb_deg(tgt_b, zen_orb, limb_orb)
-                >= self.earthlimb_min.to(u.deg).value
+                >= self._effective_earthlimb_min_deg(
+                    tgt_b, zen_orb, bu_orb["sun"]
+                )
             )
             if self.mars_min > 0 * u.deg:
                 bs_orb &= (
@@ -951,7 +1052,9 @@ class Visibility:
             )
             bs_inp &= (
                 self._fast_limb_deg(chunk_tgt_b, zen_inp, limb_inp)
-                >= self.earthlimb_min.to(u.deg).value
+                >= self._effective_earthlimb_min_deg(
+                    chunk_tgt_b, zen_inp, bu_inp["sun"]
+                )
             )
             if self.mars_min > 0 * u.deg:
                 bs_inp &= (
@@ -1582,13 +1685,47 @@ class Visibility:
                 continue  # handled in dedicated section below
             status = "PASS" if constraints[body] else "FAIL"
             status_symbol = "✓" if constraints[body] else "✗"
-            min_sep = getattr(self, f"{body}_min")
             actual_sep = separations[body]
 
-            lines.append(
-                f"{body.capitalize():<10} {status_symbol} {status:<4} "
-                f"(req: {min_sep:>6.1f}, actual: {actual_sep:>6.1f})"
-            )
+            if body == "earthlimb" and (
+                self.earthlimb_day_min is not None
+                or self.earthlimb_night_min is not None
+            ):
+                # Show day/night thresholds and which is active
+                day_lim = (
+                    self.earthlimb_day_min
+                    if self.earthlimb_day_min is not None
+                    else self.earthlimb_min
+                )
+                night_lim = (
+                    self.earthlimb_night_min
+                    if self.earthlimb_night_min is not None
+                    else self.earthlimb_min
+                )
+                # Determine whether limb point is sunlit at this time
+                observer_location = self._get_observer_location(time)
+                obs_gcrs = observer_location.get_gcrs(obstime=time)
+                obs_xyz = obs_gcrs.cartesian.xyz.to(u.m).value
+                zenith_u = obs_xyz / np.linalg.norm(obs_xyz)
+                tgt_gcrs = target_coord.transform_to(GCRS(obstime=time))
+                tgt_xyz = tgt_gcrs.cartesian.xyz.value
+                tgt_u = tgt_xyz / np.linalg.norm(tgt_xyz)
+                sun_body = get_body("sun", time=time, location=observer_location)
+                sun_xyz = sun_body.cartesian.xyz.value
+                sun_u = sun_xyz / np.linalg.norm(sun_xyz)
+                is_sunlit = bool(self._earthlimb_is_sunlit(tgt_u, zenith_u, sun_u))
+                side = "day" if is_sunlit else "night"
+                eff_lim = day_lim if is_sunlit else night_lim
+                lines.append(
+                    f"{body.capitalize():<10} {status_symbol} {status:<4} "
+                    f"(req: {eff_lim:>6.1f} [{side}], actual: {actual_sep:>6.1f})"
+                )
+            else:
+                min_sep = getattr(self, f"{body}_min")
+                lines.append(
+                    f"{body.capitalize():<10} {status_symbol} {status:<4} "
+                    f"(req: {min_sep:>6.1f}, actual: {actual_sep:>6.1f})"
+                )
 
         # Star tracker constraints section
         if self._st_constraint_active:
