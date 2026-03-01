@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pandoravisibility"
-version = "0.1.0"
+version = "0.2.0"
 description = "A tool for calculating the visibility of targets from Pandora"
 authors = ["Tom Barclay <barclay.astro@gmail.com>"]
 license = "BSD-3-Clause license"
@@ -11,8 +11,10 @@ python = ">=3.11,<4.0"
 numpy = ">=2.0"
 sgp4 = "^2.25"
 astropy = ">=7.0"
-pandas = "^2.2.3"
+pandas = ">=2.2.3"
 matplotlib = {version = "^3.9", optional = true}
+jupyter = "^1.1.1"
+notebook = "^7.5.4"
 
 [tool.poetry.extras]
 plotting = ["matplotlib"]
