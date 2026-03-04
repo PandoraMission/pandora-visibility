@@ -20,15 +20,15 @@ def test_numpy_compatibility():
 
 def test_visibility():
     # Example TLE lines (replace with actual TLE data)
-    line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
-    line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+    line1 = "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+    line2 = "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
 
     vis = Visibility(line1, line2)
 
     # Test get_period method
     period = vis.get_period()
-    assert period.value > 96.68
-    assert period.value < 96.69
+    assert period.value > 96.78
+    assert period.value < 96.79
 
     # Test get_state method with a time input
     from astropy.time import Time
@@ -38,19 +38,19 @@ def test_visibility():
     assert state is not None
 
     # test satnum
-    assert int(vis.tle.satnum) == 99152
+    assert int(vis.tle.satnum) == 67395
 
     from astropy import units as u
     from astropy.constants import R_earth
 
-    assert (vis.tle.a * u.earthRad - R_earth).to(u.km).value > 596
-    assert (vis.tle.a * u.earthRad - R_earth).to(u.km).value < 597
+    assert (vis.tle.a * u.earthRad - R_earth).to(u.km).value > 601
+    assert (vis.tle.a * u.earthRad - R_earth).to(u.km).value < 602
 
 
 def test_target():
     # Example TLE lines
-    line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
-    line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+    line1 = "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+    line2 = "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
 
     vis = Visibility(line1, line2)
 
@@ -73,13 +73,13 @@ def test_target():
     targ_vis = vis.get_visibility(target_coord, times)
 
     assert int(targ_vis.shape[0]) == 144
-    assert targ_vis.astype(int).sum() == 75
+    assert targ_vis.astype(int).sum() == 78
 
 
 def test_custom_limits():
     # Example TLE lines
-    line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
-    line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+    line1 = "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+    line2 = "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
 
     from astropy import units as u
 
@@ -110,7 +110,7 @@ def test_custom_limits():
     targ_vis = vis.get_visibility(target_coord, times)
 
     assert int(targ_vis.shape[0]) == 144
-    assert targ_vis.astype(int).sum() == 85
+    assert targ_vis.astype(int).sum() == 90
 
 
 def test_edge_cases():
@@ -119,8 +119,8 @@ def test_edge_cases():
     from astropy.coordinates import SkyCoord
     from astropy.time import Time
 
-    line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
-    line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+    line1 = "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+    line2 = "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
 
     _ = Visibility(line1, line2)
     target_coord = SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")

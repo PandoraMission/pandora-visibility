@@ -485,6 +485,11 @@ def run_survey(config: Optional[SurveyConfig] = None) -> SurveyResults:
 
     log("Roll sweep complete.")
 
+    # Normalize roll angles to [-180, 180]
+    best_roll_deg = (best_roll_deg + 180) % 360 - 180
+    second_roll_deg = (second_roll_deg + 180) % 360 - 180
+    sun_roll_deg = (sun_roll_deg + 180) % 360 - 180
+
     return SurveyResults(
         config=cfg,
         ra_vals=ra_vals,
