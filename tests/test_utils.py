@@ -29,8 +29,8 @@ class TestAnalyzeYearlyVisibility:
     @pytest.fixture
     def tle_data(self):
         """Standard TLE data for testing."""
-        line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
-        line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+        line1 = "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+        line2 = "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
         return line1, line2
 
     @pytest.fixture
@@ -534,8 +534,8 @@ class TestAnalyzeTargetYearlyVisibility:
     @pytest.fixture
     def tle_data(self):
         """Standard TLE data for testing."""
-        line1 = "1 99152U 25037A   25216.00000000 .000000000  00000+0  00000-0 0   427"
-        line2 = "2 99152  97.7015  44.6980 0000010   0.1045   0.0000 14.89350717  1230"
+        line1 = "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+        line2 = "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
         return line1, line2
 
     def test_complete_workflow(self, tle_data, capsys):
