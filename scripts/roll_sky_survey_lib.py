@@ -18,7 +18,12 @@ Usage (CLI)
 
 Usage (notebook / import)
 -------------------------
+    import sys, pathlib
+    sys.path.insert(0, str(pathlib.Path("scripts").resolve()))
     from roll_sky_survey_lib import SurveyConfig, run_survey, print_summary, plot_sky_map
+
+    # Or, if scripts/ is already on sys.path or PYTHONPATH:
+    #   from roll_sky_survey_lib import SurveyConfig, run_survey, print_summary, plot_sky_map
 
     cfg = SurveyConfig()                       # defaults, or override fields
     results = run_survey(cfg)
@@ -31,12 +36,10 @@ from dataclasses import dataclass, field, fields
 from typing import Optional
 
 import numpy as np
-import matplotlib.pyplot as plt
 from astropy import units as u
 from astropy.constants import R_earth as _Re
 from astropy.coordinates import GCRS, SkyCoord, get_body
 from astropy.time import Time
-from matplotlib.colors import BoundaryNorm, ListedColormap
 
 from pandoravisibility import Visibility
 
@@ -607,6 +610,15 @@ def plot_sky_map(results: SurveyResults, savepath: Optional[str] = None,
     -------
     matplotlib.figure.Figure
     """
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import BoundaryNorm, ListedColormap
+    except ImportError:
+        raise ImportError(
+            "matplotlib is required for plot_sky_map(). "
+            "Install it with:  pip install pandoravisibility[plotting]"
+        ) from None
+
     r = results
     cfg = r.config
     N_sky = len(r.ra_flat)

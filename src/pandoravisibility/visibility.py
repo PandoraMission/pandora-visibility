@@ -529,7 +529,8 @@ class Visibility:
         }
 
     def _get_visibility_single(
-        self, target_coord: SkyCoord, time: Time, pre: dict
+        self, target_coord: SkyCoord, time: Time, pre: dict,
+        effective_roll=None,
     ):
         """Visibility for one scalar target using precomputed time data."""
         body_units = pre["body_units"]
@@ -575,14 +576,17 @@ class Visibility:
 
         # Star tracker constraints
         if self._st_constraint_active:
-            st_result = self._get_st_constraint_fast(tgt_unit, time, pre)
+            st_result = self._get_st_constraint_fast(
+                tgt_unit, time, pre, effective_roll=effective_roll,
+            )
             result = result & st_result
 
         if time.isscalar:
             return bool(result)
         return np.asarray(result)
 
-    def _get_st_constraint_fast(self, tgt_unit, time, pre):
+    def _get_st_constraint_fast(self, tgt_unit, time, pre, *,
+                                effective_roll=None):
         """Star tracker constraint check using pure numpy.
 
         Computes the payload attitude matrix once and applies it to both
@@ -597,15 +601,18 @@ class Visibility:
             Observation time (scalar or array).
         pre : dict
             Precomputed data from ``_precompute()``.
+        effective_roll : Quantity or None
+            Roll angle to use.  If ``None``, falls back to ``self.roll``.
         """
+        roll = effective_roll if effective_roll is not None else self.roll
         body_units = pre["body_units"]
         zenith_unit = pre["zenith_unit"]
         limb_rad = pre["limb_angle_rad"]
         sun_vec = body_units["sun"]
 
         # Compute payload attitude ONCE for both trackers
-        if self.roll is not None:
-            roll_rad = self.roll.to(u.rad).value
+        if roll is not None:
+            roll_rad = roll.to(u.rad).value
             x_payload, y_payload = self._roll_attitude(tgt_unit, roll_rad)
             if time.isscalar:
                 z_col = tgt_unit
@@ -718,18 +725,25 @@ class Visibility:
             - N coords (list or array) + scalar time → np.ndarray of bool, shape (N,)
             - N coords (list or array) + array time (M,) → np.ndarray of bool, shape (N, M)
         """
-        # Optionally override instance roll for this call
-        saved_roll = self.roll
+        # Resolve effective roll without mutating instance state
         if roll is not None:
             _validate_angle(roll, "roll")
-            self.roll = roll.to(u.deg)
-        try:
-            return self._get_visibility_inner(target_coord, time)
-        finally:
-            self.roll = saved_roll
+            effective_roll = roll.to(u.deg)
+        else:
+            effective_roll = self.roll
+        return self._get_visibility_inner(target_coord, time, effective_roll)
 
-    def _get_visibility_inner(self, target_coord: SkyCoord, time: Time):
-        """Core visibility logic (called by get_visibility after roll override)."""
+    def _get_visibility_inner(self, target_coord: SkyCoord, time: Time,
+                               effective_roll=None):
+        """Core visibility logic (called by get_visibility).
+
+        Parameters
+        ----------
+        effective_roll : Quantity or None
+            Roll angle to use for this evaluation.  Passed through to
+            ``_get_visibility_single`` → ``_get_st_constraint_fast``
+            so that instance state is never mutated.
+        """
         # Precompute satellite state and body positions once for all targets
         pre = self._precompute(time)
 
@@ -737,17 +751,19 @@ class Visibility:
         # Each target defines a different boresight, so must be evaluated independently
         if isinstance(target_coord, list):
             return np.array(
-                [self._get_visibility_single(tc, time, pre) for tc in target_coord]
+                [self._get_visibility_single(tc, time, pre, effective_roll)
+                 for tc in target_coord]
             )
         if hasattr(target_coord, "shape") and target_coord.shape != ():
             return np.array(
                 [
-                    self._get_visibility_single(target_coord[i], time, pre)
+                    self._get_visibility_single(target_coord[i], time, pre,
+                                                effective_roll)
                     for i in range(len(target_coord))
                 ]
             )
 
-        return self._get_visibility_single(target_coord, time, pre)
+        return self._get_visibility_single(target_coord, time, pre, effective_roll)
 
     def get_visibility_best_roll(
         self, target_coord: SkyCoord, time: Time, roll_step=2 * u.deg,
@@ -808,6 +824,10 @@ class Visibility:
         """
         _validate_angle(roll_step, "roll_step")
         _validate_time_quantity(orbit_time_step, "orbit_time_step")
+        if not roll_step.isscalar:
+            raise ValueError("roll_step must be a scalar Quantity")
+        if not orbit_time_step.isscalar:
+            raise ValueError("orbit_time_step must be a scalar Quantity")
 
         period = self.get_period()
         is_scalar = time.isscalar

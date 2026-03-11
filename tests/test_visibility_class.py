@@ -700,7 +700,6 @@ class TestStarTrackerConstraints:
         sun_coord = get_body("sun", time=test_time, location=observer_location)
 
         # Use the sun position as target — degenerate attitude
-        normal_target = SkyCoord(79.17, 45.99, frame="icrs", unit="deg")
         times = Time("2025-06-21T12:00:00") + np.array([0, 1]) * u.hour
 
         # Should not raise; degenerate indices should just give False constraint
@@ -907,14 +906,8 @@ class TestRollParameter:
         sc_scalar = vis._get_star_tracker_skycoord(target_coord, test_time, 1)
         times_arr = Time([test_time.iso])
         sc_array = vis._get_star_tracker_skycoord(target_coord, times_arr, 1)
-        # Should produce nearly identical pointing
-        sc_s = SkyCoord(
-            sc_scalar.spherical.lon, sc_scalar.spherical.lat, frame="icrs"
-        )
-        sc_a = SkyCoord(
-            sc_array.spherical.lon[0], sc_array.spherical.lat[0], frame="icrs"
-        )
-        sep = sc_s.separation(sc_a)
+        # Compare directly in the native frame (both are GCRS-like)
+        sep = sc_scalar.separation(sc_array[0])
         assert sep.arcsec < 1.0, f"Scalar/array mismatch: {sep.arcsec:.2f} arcsec"
 
     def test_fixed_roll_constant_pointing(self, line1, line2, target_coord):
