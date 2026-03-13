@@ -164,6 +164,10 @@ class Visibility:
         if self.roll is not None:
             self.roll = self.roll.to(u.deg)
 
+        # One-entry cache for time-dependent quantities reused across calls.
+        self._precompute_cache_key = None
+        self._precompute_cache_value = None
+
     def __repr__(self) -> str:
         """Return a string representation of the TLE object for debugging."""
         constraints = []
@@ -476,6 +480,18 @@ class Visibility:
         this dict to ``_get_visibility_single`` avoids redundant SGP4
         propagation, ephemeris lookups, and coordinate transforms.
         """
+        # Cache by object identity: common workflows reuse the same Time object
+        # across repeated calls (e.g. many target batches on one time grid).
+        cache_key = (
+            id(time),
+            bool(self.mars_min > 0 * u.deg),
+            bool(self.jupiter_min > 0 * u.deg),
+        )
+
+        if (cache_key == self._precompute_cache_key and
+                self._precompute_cache_value is not None):
+            return self._precompute_cache_value
+
         observer_location = self._get_observer_location(time)
 
         # Observer GCRS position → zenith direction + Earth limb angle
@@ -521,35 +537,36 @@ class Visibility:
                     xyz, axis=0, keepdims=True
                 )
 
-        return {
+        pre = {
             "observer_location": observer_location,
             "body_units": body_units,
             "zenith_unit": zenith_unit,
             "limb_angle_rad": limb_angle_rad,
         }
+        self._precompute_cache_key = cache_key
+        self._precompute_cache_value = pre
+        return pre
 
     def _get_visibility_single(
         self, target_coord: SkyCoord, time: Time, pre: dict,
-        effective_roll=None,
+        effective_roll=None, gcrs_frame=None,
     ):
         """Visibility for one scalar target using precomputed time data."""
         body_units = pre["body_units"]
         zenith_unit = pre["zenith_unit"]
         limb_rad = pre["limb_angle_rad"]
 
-        # Target direction unit vector(s) in GCRS at each observation time.
-        # Using obstime=time (not just time[0]) ensures aberration and
-        # precession are correctly evaluated for long time arrays.
-        tgt_gcrs = target_coord.transform_to(GCRS(obstime=time))
+        # Target direction unit vector(s) in GCRS.
+        frame = gcrs_frame if gcrs_frame is not None else GCRS(obstime=time)
+        tgt_gcrs = target_coord.transform_to(frame)
         tgt_xyz = tgt_gcrs.cartesian.xyz.value
-
         if time.isscalar:
             tgt_unit = tgt_xyz / np.linalg.norm(tgt_xyz)  # (3,)
             tgt_b = tgt_unit
         else:
-            tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)  # (3, N)
-            # Representative direction for attitude computation in ST
-            # constraints (aberration shift <0.02"/yr is negligible there)
+            tgt_b = tgt_xyz / np.linalg.norm(
+                tgt_xyz, axis=0, keepdims=True
+            )  # (3, N)
             tgt_unit = tgt_b[:, 0].copy()
 
         # Boresight body constraints via fast dot-product separation
@@ -746,24 +763,27 @@ class Visibility:
         """
         # Precompute satellite state and body positions once for all targets
         pre = self._precompute(time)
+        gcrs_frame = GCRS(obstime=time)
 
         # Handle multiple target coordinates (list or array SkyCoord)
         # Each target defines a different boresight, so must be evaluated independently
         if isinstance(target_coord, list):
             return np.array(
-                [self._get_visibility_single(tc, time, pre, effective_roll)
+                [self._get_visibility_single(tc, time, pre, effective_roll,
+                                             gcrs_frame)
                  for tc in target_coord]
             )
         if hasattr(target_coord, "shape") and target_coord.shape != ():
             return np.array(
                 [
                     self._get_visibility_single(target_coord[i], time, pre,
-                                                effective_roll)
+                                                effective_roll, gcrs_frame)
                     for i in range(len(target_coord))
                 ]
             )
 
-        return self._get_visibility_single(target_coord, time, pre, effective_roll)
+        return self._get_visibility_single(target_coord, time, pre,
+                                           effective_roll, gcrs_frame)
 
     def get_visibility_best_roll(
         self, target_coord: SkyCoord, time: Time, roll_step=2 * u.deg,
@@ -835,8 +855,7 @@ class Visibility:
             time = Time([time])
         N_input = len(time)
 
-        # Per-timestep target direction in GCRS (accounts for aberration
-        # and precession over long time arrays).
+        # Target direction in GCRS for input boresight checks.
         tgt_gcrs = target_coord.transform_to(GCRS(obstime=time))
         tgt_xyz = tgt_gcrs.cartesian.xyz.value
         tgt_b_all = tgt_xyz / np.linalg.norm(
