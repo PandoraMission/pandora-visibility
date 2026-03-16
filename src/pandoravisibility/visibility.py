@@ -83,6 +83,7 @@ class Visibility:
     EARTHLIMB_MIN = 20 * u.deg
     EARTHLIMB_DAY_MIN = None    # None = use EARTHLIMB_MIN
     EARTHLIMB_NIGHT_MIN = None  # None = use EARTHLIMB_MIN
+    TWILIGHT_MARGIN = 0 * u.deg  # 0 = sharp terminator (current behaviour)
     MARS_MIN = 0 * u.deg
     JUPITER_MIN = 0 * u.deg
 
@@ -120,6 +121,7 @@ class Visibility:
         _angle_params = [
             "moon_min", "sun_min", "earthlimb_min",
             "earthlimb_day_min", "earthlimb_night_min",
+            "twilight_margin",
             "mars_min",
             "jupiter_min", "st_sun_min", "st_moon_min",
             "st_earthlimb_min", "st1_earthlimb_min", "st2_earthlimb_min",
@@ -138,6 +140,9 @@ class Visibility:
         )
         self.earthlimb_night_min = custom_limits.get(
             "earthlimb_night_min", self.EARTHLIMB_NIGHT_MIN
+        )
+        self.twilight_margin = custom_limits.get(
+            "twilight_margin", self.TWILIGHT_MARGIN
         )
         self.mars_min = custom_limits.get("mars_min", self.MARS_MIN)
         self.jupiter_min = custom_limits.get("jupiter_min", self.JUPITER_MIN)
@@ -180,6 +185,8 @@ class Visibility:
             night_lim = self.earthlimb_night_min if self.earthlimb_night_min is not None else self.earthlimb_min
             constraints.append(f"limb_day≥{day_lim:.0f}")
             constraints.append(f"limb_night≥{night_lim:.0f}")
+            if self.twilight_margin > 0 * u.deg:
+                constraints.append(f"twilight_margin={self.twilight_margin:.0f}")
         elif self.earthlimb_min > 0 * u.deg:
             constraints.append(f"limb≥{self.earthlimb_min:.0f}")
         if self.mars_min > 0 * u.deg:
@@ -390,7 +397,9 @@ class Visibility:
         return np.rad2deg(elev + limb_angle_rad)
 
     @staticmethod
-    def _earthlimb_is_sunlit(target_unit, zenith_unit, sun_unit, limb_angle_rad=None):
+    def _earthlimb_is_sunlit(target_unit, zenith_unit, sun_unit,
+                             limb_angle_rad=None,
+                             twilight_margin_deg=0.0):
         """Whether the nearest Earth limb point to the target is sunlit.
 
         The nearest limb point's outward surface normal is:
@@ -400,7 +409,7 @@ class Visibility:
         where *limb_dir* is the projection of the target direction onto
         the plane perpendicular to the zenith, and *limb_angle* =
         arccos(R_earth / observer_distance).  The limb point is sunlit
-        when ``dot(n, sun) > 0``.
+        when ``dot(n, sun) > -sin(twilight_margin)``.
 
         Parameters
         ----------
@@ -414,6 +423,10 @@ class Visibility:
             Earth-limb half-angle in radians (``arccos(R_earth / d)``).
             When *None*, falls back to a simple horizontal projection
             (ignoring the zenith component of the surface normal).
+        twilight_margin_deg : float
+            Degrees past the geometric terminator to still classify as
+            sunlit.  0 (default) reproduces the original sharp
+            terminator.  18 is analogous to astronomical twilight.
 
         Returns
         -------
@@ -428,16 +441,18 @@ class Visibility:
         proj_norm = np.linalg.norm(proj, axis=0, keepdims=True)
         limb_unit = proj / np.where(proj_norm < 1e-12, 1.0, proj_norm)
 
+        threshold = -np.sin(np.deg2rad(twilight_margin_deg))
+
         if limb_angle_rad is None:
             # Legacy fallback: horizontal projection only
-            return np.sum(limb_unit * sun_unit, axis=0) > 0
+            return np.sum(limb_unit * sun_unit, axis=0) > threshold
 
         cos_la = np.cos(limb_angle_rad)
         sin_la = np.sin(limb_angle_rad)
         # Surface normal of the limb point
         dot_n_sun = cos_la * np.sum(zenith_unit * sun_unit, axis=0) + \
                     sin_la * np.sum(limb_unit * sun_unit, axis=0)
-        return dot_n_sun > 0
+        return dot_n_sun > threshold
 
     def _effective_earthlimb_min_deg(self, target_unit, zenith_unit, sun_unit,
                                      limb_angle_rad=None):
@@ -468,8 +483,11 @@ class Visibility:
             else self.earthlimb_min.to(u.deg).value
         )
 
-        sunlit = self._earthlimb_is_sunlit(target_unit, zenith_unit, sun_unit,
-                                           limb_angle_rad=limb_angle_rad)
+        sunlit = self._earthlimb_is_sunlit(
+            target_unit, zenith_unit, sun_unit,
+            limb_angle_rad=limb_angle_rad,
+            twilight_margin_deg=self.twilight_margin.to(u.deg).value,
+        )
         return np.where(sunlit, day_deg, night_deg)
 
     def _precompute(self, time: Time) -> dict:
@@ -1789,7 +1807,8 @@ class Visibility:
                 with np.errstate(invalid="ignore"):
                     la_rad = np.arccos(_R_EARTH_M / obs_dist)
                 is_sunlit = bool(self._earthlimb_is_sunlit(
-                    tgt_u, zenith_u, sun_u, limb_angle_rad=la_rad
+                    tgt_u, zenith_u, sun_u, limb_angle_rad=la_rad,
+                    twilight_margin_deg=self.twilight_margin.to(u.deg).value,
                 ))
                 side = "day" if is_sunlit else "night"
                 eff_lim = day_lim if is_sunlit else night_lim

@@ -1487,3 +1487,120 @@ class TestEarthlimbDayNight:
         assert isinstance(result, np.ndarray)
         assert result.shape == times.shape
         assert result.dtype == bool
+
+    # ── Twilight margin ─────────────────────────────────────────────
+
+    def test_twilight_margin_default_zero(self, line1, line2):
+        """twilight_margin defaults to 0 deg."""
+        vis = Visibility(line1, line2)
+        assert vis.twilight_margin == 0 * u.deg
+
+    def test_twilight_margin_stored(self, line1, line2):
+        """Custom twilight_margin is stored on the instance."""
+        vis = Visibility(line1, line2, twilight_margin=18 * u.deg)
+        assert vis.twilight_margin == 18 * u.deg
+
+    def test_twilight_margin_angle_validation(self, line1, line2):
+        """Bare float without unit raises TypeError."""
+        with pytest.raises(TypeError, match="astropy Quantity"):
+            Visibility(line1, line2, twilight_margin=18)
+
+    def test_twilight_margin_zero_matches_original(self, line1, line2, target_coord):
+        """margin=0 gives identical visibility to no-margin (backward compat)."""
+        times = Time("2025-01-01T00:00:00") + np.arange(200) * u.min
+        vis_default = Visibility(
+            line1, line2,
+            earthlimb_day_min=40 * u.deg,
+            earthlimb_night_min=15 * u.deg,
+        )
+        vis_zero = Visibility(
+            line1, line2,
+            earthlimb_day_min=40 * u.deg,
+            earthlimb_night_min=15 * u.deg,
+            twilight_margin=0 * u.deg,
+        )
+        r_default = vis_default.get_visibility(target_coord, times)
+        r_zero = vis_zero.get_visibility(target_coord, times)
+        np.testing.assert_array_equal(r_default, r_zero)
+
+    def test_twilight_margin_more_conservative(self, line1, line2, target_coord):
+        """Positive margin classifies more timesteps as dayside → fewer visible."""
+        times = Time("2026-06-01T00:00:00") + np.arange(1440) * u.min
+        vis_sharp = Visibility(
+            line1, line2,
+            earthlimb_day_min=40 * u.deg,
+            earthlimb_night_min=15 * u.deg,
+            twilight_margin=0 * u.deg,
+        )
+        vis_margin = Visibility(
+            line1, line2,
+            earthlimb_day_min=40 * u.deg,
+            earthlimb_night_min=15 * u.deg,
+            twilight_margin=18 * u.deg,
+        )
+        r_sharp = vis_sharp.get_visibility(target_coord, times)
+        r_margin = vis_margin.get_visibility(target_coord, times)
+        # Margin can only remove visibility, never add it
+        assert np.all(r_margin <= r_sharp)
+        assert np.sum(r_margin) <= np.sum(r_sharp)
+
+    def test_twilight_margin_sunlit_synthetic(self):
+        """Twilight margin shifts the sunlit boundary in synthetic geometry.
+
+        With target in +X, zenith in +Z, sun barely below limb in -X:
+          dot(n, sun) = -sin(la) ≈ -0.41 (for la_rad = arccos(0.91))
+        Default (margin=0): not sunlit.
+        Margin=30 → threshold = -sin(30°) = -0.5 → still sunlit."""
+        target = np.array([1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        la_rad = np.arccos(0.91)
+
+        # Sun in -X: dot(n, sun) = -sin(la) ≈ -0.41
+        sun = np.array([-1.0, 0.0, 0.0])
+
+        # margin=0: not sunlit (dot_n_sun ≈ -0.41 < 0)
+        assert bool(Visibility._earthlimb_is_sunlit(
+            target, zenith, sun, limb_angle_rad=la_rad,
+            twilight_margin_deg=0.0,
+        )) is False
+
+        # margin=30: threshold = -sin(30°) = -0.5
+        #   dot_n_sun ≈ -0.41 > -0.5 → classified as sunlit
+        assert bool(Visibility._earthlimb_is_sunlit(
+            target, zenith, sun, limb_angle_rad=la_rad,
+            twilight_margin_deg=30.0,
+        )) is True
+
+    def test_twilight_margin_no_effect_without_day_night(self, line1, line2, target_coord):
+        """When day/night are both None, twilight_margin has no effect."""
+        times = Time("2025-01-01T00:00:00") + np.arange(100) * u.min
+        vis_plain = Visibility(line1, line2, earthlimb_min=20 * u.deg)
+        vis_margin = Visibility(
+            line1, line2,
+            earthlimb_min=20 * u.deg,
+            twilight_margin=30 * u.deg,
+        )
+        r_plain = vis_plain.get_visibility(target_coord, times)
+        r_margin = vis_margin.get_visibility(target_coord, times)
+        np.testing.assert_array_equal(r_plain, r_margin)
+
+    def test_twilight_margin_repr(self, line1, line2):
+        """repr shows twilight_margin when > 0 and day/night is set."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=40 * u.deg,
+            earthlimb_night_min=15 * u.deg,
+            twilight_margin=18 * u.deg,
+        )
+        r = repr(vis)
+        assert "twilight_margin=18 deg" in r
+
+    def test_twilight_margin_repr_hidden_when_zero(self, line1, line2):
+        """repr does not show twilight_margin when it's 0."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=40 * u.deg,
+            earthlimb_night_min=15 * u.deg,
+        )
+        r = repr(vis)
+        assert "twilight_margin" not in r
