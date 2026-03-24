@@ -1467,9 +1467,10 @@ class TestEarthlimbDayNight:
         assert vis.earthlimb_night_min == 5 * u.deg
         assert vis.earthlimb_day_min is None
         # Day threshold should use earthlimb_min
+        # Sun aligned with zenith so subsatellite point is sunlit (day)
         target = np.array([1.0, 0.0, 0.0])
         zenith = np.array([0.0, 0.0, 1.0])
-        sun_lit = np.array([1.0, 0.0, 0.0])
+        sun_lit = np.array([0.0, 0.0, 1.0])
         eff = vis._effective_earthlimb_min_deg(target, zenith, sun_lit)
         assert float(eff) == pytest.approx(20.0)
 
@@ -1607,10 +1608,10 @@ class TestEarthlimbDayNight:
 
     # ── daynight_mode / subsatellite ────────────────────────────────
 
-    def test_daynight_mode_default_is_limb(self, line1, line2):
-        """Default daynight_mode is 'limb'."""
+    def test_daynight_mode_default_is_subsatellite(self, line1, line2):
+        """Default daynight_mode is 'subsatellite'."""
         vis = Visibility(line1, line2)
-        assert vis.daynight_mode == "limb"
+        assert vis.daynight_mode == "subsatellite"
 
     def test_daynight_mode_subsatellite_stored(self, line1, line2):
         """Custom daynight_mode='subsatellite' is stored."""
@@ -1707,7 +1708,7 @@ class TestEarthlimbDayNight:
         )
 
     def test_subsatellite_mode_repr(self, line1, line2):
-        """repr shows daynight=subsatellite when mode is non-default."""
+        """repr omits daynight when mode is default 'subsatellite'."""
         vis = Visibility(
             line1, line2,
             earthlimb_day_min=25 * u.deg,
@@ -1715,10 +1716,10 @@ class TestEarthlimbDayNight:
             daynight_mode="subsatellite",
         )
         r = repr(vis)
-        assert "daynight=subsatellite" in r
+        assert "daynight=" not in r
 
-    def test_limb_mode_repr_omits_daynight(self, line1, line2):
-        """repr does not show daynight when mode is default 'limb'."""
+    def test_limb_mode_repr_shows_daynight(self, line1, line2):
+        """repr shows daynight=limb when mode is non-default."""
         vis = Visibility(
             line1, line2,
             earthlimb_day_min=25 * u.deg,
@@ -1726,7 +1727,7 @@ class TestEarthlimbDayNight:
             daynight_mode="limb",
         )
         r = repr(vis)
-        assert "daynight=" not in r
+        assert "daynight=limb" in r
 
     def test_subsatellite_no_effect_without_day_night(self, line1, line2, target_coord):
         """When day/night both None, daynight_mode makes no difference."""
