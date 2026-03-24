@@ -5,7 +5,7 @@ Tests for Visibility class methods that are not covered in test_import.py
 import numpy as np
 import pytest
 from astropy import units as u
-from astropy.coordinates import SkyCoord, get_body
+from astropy.coordinates import GCRS, SkyCoord, get_body
 from astropy.time import Time
 
 from pandoravisibility import Visibility
@@ -1604,3 +1604,135 @@ class TestEarthlimbDayNight:
         )
         r = repr(vis)
         assert "twilight_margin" not in r
+
+    # ── daynight_mode / subsatellite ────────────────────────────────
+
+    def test_daynight_mode_default_is_limb(self, line1, line2):
+        """Default daynight_mode is 'limb'."""
+        vis = Visibility(line1, line2)
+        assert vis.daynight_mode == "limb"
+
+    def test_daynight_mode_subsatellite_stored(self, line1, line2):
+        """Custom daynight_mode='subsatellite' is stored."""
+        vis = Visibility(line1, line2, daynight_mode="subsatellite")
+        assert vis.daynight_mode == "subsatellite"
+
+    def test_daynight_mode_invalid_raises(self, line1, line2):
+        """Invalid daynight_mode raises ValueError."""
+        with pytest.raises(ValueError, match="daynight_mode"):
+            Visibility(line1, line2, daynight_mode="bogus")
+
+    def test_subsatellite_is_sunlit_basic(self):
+        """Subsatellite-point sunlit detection with known geometry."""
+        # Zenith in +Z, sun in +Z → dayside (dot > 0)
+        zenith = np.array([0.0, 0.0, 1.0])
+        sun_day = np.array([0.0, 0.0, 1.0])
+        assert bool(Visibility._subsatellite_is_sunlit(zenith, sun_day)) is True
+
+        # Zenith in +Z, sun in -Z → nightside (dot < 0)
+        sun_night = np.array([0.0, 0.0, -1.0])
+        assert bool(Visibility._subsatellite_is_sunlit(zenith, sun_night)) is False
+
+        # Zenith in +Z, sun in +X → exactly at terminator (dot = 0)
+        # With margin=0 threshold is 0, so dot=0 is NOT > 0 → nightside
+        sun_terminator = np.array([1.0, 0.0, 0.0])
+        assert bool(Visibility._subsatellite_is_sunlit(zenith, sun_terminator)) is False
+
+    def test_subsatellite_is_sunlit_twilight_margin(self):
+        """Twilight margin shifts the subsatellite day/night boundary."""
+        zenith = np.array([0.0, 0.0, 1.0])
+        # Sun perpendicular → dot(zenith, sun) = 0
+        sun_perp = np.array([1.0, 0.0, 0.0])
+
+        # margin=0: threshold=0, dot=0 → NOT sunlit
+        assert bool(Visibility._subsatellite_is_sunlit(
+            zenith, sun_perp, twilight_margin_deg=0.0
+        )) is False
+
+        # margin=10: threshold=-sin(10°)≈-0.17, dot=0 > -0.17 → sunlit
+        assert bool(Visibility._subsatellite_is_sunlit(
+            zenith, sun_perp, twilight_margin_deg=10.0
+        )) is True
+
+    def test_subsatellite_is_sunlit_array(self):
+        """Subsatellite sunlit detection with array inputs."""
+        zenith = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]])
+        # First timestep: sun above → day; second: sun below → night
+        sun = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, -1.0]])
+        result = Visibility._subsatellite_is_sunlit(zenith, sun)
+        assert bool(result[0]) is True
+        assert bool(result[1]) is False
+
+    def test_subsatellite_mode_differs_from_limb(self, line1, line2, target_coord):
+        """subsatellite and limb modes classify day/night differently.
+
+        We verify this at the threshold-level: for the same timesteps,
+        the effective threshold arrays should differ when the two modes
+        disagree on which timesteps are day vs night.
+        """
+        times = Time("2026-06-01T00:00:00") + np.arange(3 * 1440) * u.min
+        vis_limb = Visibility(
+            line1, line2,
+            earthlimb_day_min=40 * u.deg,
+            earthlimb_night_min=5 * u.deg,
+            daynight_mode="limb",
+        )
+        vis_subsat = Visibility(
+            line1, line2,
+            earthlimb_day_min=40 * u.deg,
+            earthlimb_night_min=5 * u.deg,
+            daynight_mode="subsatellite",
+        )
+        # Force precomputation and extract effective thresholds
+        pre_limb = vis_limb._precompute(times)
+        pre_subsat = vis_subsat._precompute(times)
+
+        # Target direction in GCRS
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+
+        thresh_limb = vis_limb._effective_earthlimb_min_deg(
+            tgt_b, pre_limb["zenith_unit"], pre_limb["body_units"]["sun"],
+            limb_angle_rad=pre_limb["limb_angle_rad"],
+        )
+        thresh_subsat = vis_subsat._effective_earthlimb_min_deg(
+            tgt_b, pre_subsat["zenith_unit"], pre_subsat["body_units"]["sun"],
+            limb_angle_rad=pre_subsat["limb_angle_rad"],
+        )
+        # The thresholds should differ on at least some timesteps
+        assert not np.array_equal(thresh_limb, thresh_subsat), (
+            "subsatellite and limb modes should produce different "
+            "day/night thresholds for at least some timesteps"
+        )
+
+    def test_subsatellite_mode_repr(self, line1, line2):
+        """repr shows daynight=subsatellite when mode is non-default."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=10 * u.deg,
+            daynight_mode="subsatellite",
+        )
+        r = repr(vis)
+        assert "daynight=subsatellite" in r
+
+    def test_limb_mode_repr_omits_daynight(self, line1, line2):
+        """repr does not show daynight when mode is default 'limb'."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=10 * u.deg,
+            daynight_mode="limb",
+        )
+        r = repr(vis)
+        assert "daynight=" not in r
+
+    def test_subsatellite_no_effect_without_day_night(self, line1, line2, target_coord):
+        """When day/night both None, daynight_mode makes no difference."""
+        times = Time("2025-01-01T00:00:00") + np.arange(200) * u.min
+        vis_limb = Visibility(line1, line2, daynight_mode="limb")
+        vis_subsat = Visibility(line1, line2, daynight_mode="subsatellite")
+        r_limb = vis_limb.get_visibility(target_coord, times)
+        r_subsat = vis_subsat.get_visibility(target_coord, times)
+        np.testing.assert_array_equal(r_limb, r_subsat)

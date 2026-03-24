@@ -84,6 +84,7 @@ class Visibility:
     EARTHLIMB_DAY_MIN = None    # None = use EARTHLIMB_MIN
     EARTHLIMB_NIGHT_MIN = None  # None = use EARTHLIMB_MIN
     TWILIGHT_MARGIN = 0 * u.deg  # 0 = sharp terminator (current behaviour)
+    DAYNIGHT_MODE = "subsatellite"  # "limb" = nearest-limb-to-target; "subsatellite" = ground below spacecraft
     MARS_MIN = 0 * u.deg
     JUPITER_MIN = 0 * u.deg
 
@@ -144,6 +145,14 @@ class Visibility:
         self.twilight_margin = custom_limits.get(
             "twilight_margin", self.TWILIGHT_MARGIN
         )
+        self.daynight_mode = custom_limits.get(
+            "daynight_mode", self.DAYNIGHT_MODE
+        )
+        if self.daynight_mode not in ("limb", "subsatellite"):
+            raise ValueError(
+                f"daynight_mode must be 'limb' or 'subsatellite', "
+                f"got {self.daynight_mode!r}"
+            )
         self.mars_min = custom_limits.get("mars_min", self.MARS_MIN)
         self.jupiter_min = custom_limits.get("jupiter_min", self.JUPITER_MIN)
 
@@ -185,6 +194,8 @@ class Visibility:
             night_lim = self.earthlimb_night_min if self.earthlimb_night_min is not None else self.earthlimb_min
             constraints.append(f"limb_day≥{day_lim:.0f}")
             constraints.append(f"limb_night≥{night_lim:.0f}")
+            if self.daynight_mode != "subsatellite" or self.twilight_margin > 0 * u.deg:
+                constraints.append(f"daynight={self.daynight_mode}")
             if self.twilight_margin > 0 * u.deg:
                 constraints.append(f"twilight_margin={self.twilight_margin:.0f}")
         elif self.earthlimb_min > 0 * u.deg:
@@ -454,14 +465,50 @@ class Visibility:
                     sin_la * np.sum(limb_unit * sun_unit, axis=0)
         return dot_n_sun > threshold
 
+    @staticmethod
+    def _subsatellite_is_sunlit(zenith_unit, sun_unit,
+                                twilight_margin_deg=0.0):
+        """Whether the subsatellite point (ground below spacecraft) is sunlit.
+
+        The subsatellite point is the point on Earth's surface directly
+        below the spacecraft.  It is sunlit when the angle between the
+        zenith direction (observer → away from Earth centre) and the Sun
+        direction is less than 90° (plus an optional twilight margin).
+
+        Geometrically: ``dot(zenith, sun) > -sin(twilight_margin)``.
+
+        Parameters
+        ----------
+        zenith_unit : ndarray, shape (3,) or (3, N)
+            Observer zenith direction unit vector(s).
+        sun_unit : ndarray, shape (3,) or (3, N)
+            Sun direction unit vector(s).
+        twilight_margin_deg : float
+            Degrees past the geometric terminator to still classify as
+            sunlit.  0 (default) gives a sharp day/night boundary.
+
+        Returns
+        -------
+        bool or ndarray of bool
+            True where the subsatellite point is sunlit.
+        """
+        threshold = -np.sin(np.deg2rad(twilight_margin_deg))
+        dot_zs = np.sum(zenith_unit * sun_unit, axis=0)
+        return dot_zs > threshold
+
     def _effective_earthlimb_min_deg(self, target_unit, zenith_unit, sun_unit,
                                      limb_angle_rad=None):
         """Per-timestep effective Earth limb threshold in degrees.
 
         When ``earthlimb_day_min`` or ``earthlimb_night_min`` is set,
         returns a scalar or array of thresholds that depend on whether
-        the nearest limb point is sunlit.  Otherwise returns a plain
-        scalar from ``earthlimb_min``.
+        the observer is over sunlit or shadowed Earth.  The method used
+        to determine day/night is controlled by ``self.daynight_mode``:
+
+        * ``"subsatellite"`` (default): subsatellite point directly below spacecraft.
+        * ``"limb"``: nearest limb point to the target direction.
+
+        Otherwise returns a plain scalar from ``earthlimb_min``.
 
         Parameters
         ----------
@@ -483,11 +530,19 @@ class Visibility:
             else self.earthlimb_min.to(u.deg).value
         )
 
-        sunlit = self._earthlimb_is_sunlit(
-            target_unit, zenith_unit, sun_unit,
-            limb_angle_rad=limb_angle_rad,
-            twilight_margin_deg=self.twilight_margin.to(u.deg).value,
-        )
+        twilight_deg = self.twilight_margin.to(u.deg).value
+
+        if self.daynight_mode == "subsatellite":
+            sunlit = self._subsatellite_is_sunlit(
+                zenith_unit, sun_unit,
+                twilight_margin_deg=twilight_deg,
+            )
+        else:
+            sunlit = self._earthlimb_is_sunlit(
+                target_unit, zenith_unit, sun_unit,
+                limb_angle_rad=limb_angle_rad,
+                twilight_margin_deg=twilight_deg,
+            )
         return np.where(sunlit, day_deg, night_deg)
 
     def _precompute(self, time: Time) -> dict:
