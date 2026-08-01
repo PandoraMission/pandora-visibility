@@ -1737,3 +1737,427 @@ class TestEarthlimbDayNight:
         r_limb = vis_limb.get_visibility(target_coord, times)
         r_subsat = vis_subsat.get_visibility(target_coord, times)
         np.testing.assert_array_equal(r_limb, r_subsat)
+
+
+class TestDynamicEarthlimb:
+    """Tests for the use_dynamic_earthlimb (DPC wedge) keep-out."""
+
+    # Keep-out values from the DPC wedge table, referenced to the limb
+    # (i.e. with the 66 deg Earth angular radius already subtracted).
+    BRIGHT = 110.0 - 66.0
+    DARK = 75.0 - 66.0
+
+    @pytest.fixture
+    def line1(self):
+        return "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+
+    @pytest.fixture
+    def line2(self):
+        return "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
+
+    @pytest.fixture
+    def target_coord(self):
+        """WASP-107 — has both sunlit and dark limb crossings in mid-2026."""
+        return SkyCoord(188.386, -10.1462, frame="icrs", unit="deg")
+
+    @pytest.fixture
+    def test_time(self):
+        return Time("2026-06-01T00:00:00")
+
+    # ── Defaults & storage ──────────────────────────────────────────
+
+    def test_default_is_false(self, line1, line2):
+        """use_dynamic_earthlimb defaults to False."""
+        vis = Visibility(line1, line2)
+        assert vis.use_dynamic_earthlimb is False
+
+    def test_stored_when_true(self, line1, line2):
+        """use_dynamic_earthlimb=True is stored on the instance."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        assert vis.use_dynamic_earthlimb is True
+
+    def test_false_matches_omitting_it(self, line1, line2, target_coord, test_time):
+        """Passing use_dynamic_earthlimb=False changes nothing."""
+        times = test_time + np.arange(300) * u.min
+        vis_omit = Visibility(line1, line2)
+        vis_false = Visibility(line1, line2, use_dynamic_earthlimb=False)
+        np.testing.assert_array_equal(
+            vis_omit.get_visibility(target_coord, times),
+            vis_false.get_visibility(target_coord, times),
+        )
+
+    # ── _dynamic_earthlimb_min_deg piecewise fit ────────────────────
+
+    def test_piecewise_flat_segments(self):
+        """Below 78 deg and at/above 90 deg the curve is flat."""
+        for illum in [0.0, 40.0, 77.0, 77.999]:
+            assert Visibility._dynamic_earthlimb_min_deg(illum) == pytest.approx(
+                self.BRIGHT
+            )
+        for illum in [90.0, 120.0, 180.0]:
+            assert Visibility._dynamic_earthlimb_min_deg(illum) == pytest.approx(
+                self.DARK
+            )
+
+    def test_piecewise_anchor_points(self):
+        """The three anchor points are hit exactly (from the Earth centre)."""
+        assert Visibility._dynamic_earthlimb_min_deg(78.0) == pytest.approx(
+            110.0 - 66.0
+        )
+        assert Visibility._dynamic_earthlimb_min_deg(89.0) == pytest.approx(
+            82.0 - 66.0
+        )
+        assert Visibility._dynamic_earthlimb_min_deg(90.0) == pytest.approx(
+            75.0 - 66.0
+        )
+
+    def test_piecewise_rule1(self):
+        """78-89 deg is a straight line from 110 to 82 deg."""
+        m = (82.0 - 110.0) / (89.0 - 78.0)
+        for illum in [78.0, 82.5, 89.0]:
+            assert Visibility._dynamic_earthlimb_min_deg(illum) == pytest.approx(
+                110.0 + m * (illum - 78.0) - 66.0
+            )
+
+    def test_piecewise_rule2(self):
+        """89-90 deg is a steeper straight line from 82 to 75 deg."""
+        m = (75.0 - 82.0) / (90.0 - 89.0)
+        for illum in [89.001, 89.5, 89.999]:
+            assert Visibility._dynamic_earthlimb_min_deg(illum) == pytest.approx(
+                82.0 + m * (illum - 89.0) - 66.0
+            )
+
+    def test_piecewise_continuous(self):
+        """The curve has no steps at the 78, 89 and 90 deg joins."""
+        for knee in [78.0, 89.0, 90.0]:
+            below = Visibility._dynamic_earthlimb_min_deg(knee - 1e-6)
+            at = Visibility._dynamic_earthlimb_min_deg(knee)
+            above = Visibility._dynamic_earthlimb_min_deg(knee + 1e-6)
+            assert below == pytest.approx(at, abs=1e-4)
+            assert above == pytest.approx(at, abs=1e-4)
+
+    def test_piecewise_monotonic_and_bounded(self):
+        """Keep-out falls monotonically from the bright to the dark value."""
+        keepout = Visibility._dynamic_earthlimb_min_deg(
+            np.linspace(0.0, 180.0, 18001)
+        )
+        assert np.all(np.diff(keepout) <= 1e-9)
+        assert keepout.max() == pytest.approx(self.BRIGHT)
+        assert keepout.min() == pytest.approx(self.DARK)
+        assert keepout[0] == pytest.approx(self.BRIGHT)
+        assert keepout[-1] == pytest.approx(self.DARK)
+
+    def test_piecewise_wraps_around(self):
+        """The curve is symmetric: -x, +x and +x+360 give the same keep-out."""
+        for illum in [0.0, 45.0, 78.0, 85.0, 89.5, 90.0, 120.0, 180.0]:
+            base = Visibility._dynamic_earthlimb_min_deg(illum)
+            assert Visibility._dynamic_earthlimb_min_deg(-illum) == pytest.approx(
+                base
+            )
+            assert Visibility._dynamic_earthlimb_min_deg(
+                illum + 360.0
+            ) == pytest.approx(base)
+            assert Visibility._dynamic_earthlimb_min_deg(
+                360.0 - illum
+            ) == pytest.approx(base)
+
+    def test_piecewise_wrap_beyond_180(self):
+        """Angles past 180 deg fold back toward the sub-solar direction."""
+        # 190 deg is 170 deg on the other side → still fully dark
+        assert Visibility._dynamic_earthlimb_min_deg(190.0) == pytest.approx(
+            Visibility._dynamic_earthlimb_min_deg(170.0)
+        )
+        # 282 deg folds to 78 deg → back on the bright ramp
+        assert Visibility._dynamic_earthlimb_min_deg(282.0) == pytest.approx(
+            Visibility._dynamic_earthlimb_min_deg(78.0)
+        )
+
+    def test_piecewise_wraps_array(self):
+        """Wrapping also works element-wise on arrays."""
+        illum = np.array([-85.0, -12.0, 275.0, 400.0])
+        np.testing.assert_allclose(
+            Visibility._dynamic_earthlimb_min_deg(illum),
+            Visibility._dynamic_earthlimb_min_deg(np.array([85.0, 12.0, 85.0, 40.0])),
+        )
+
+    def test_illumination_angle_range(self, line1, line2, target_coord, test_time):
+        """The computed illumination angle always lands in [0, 180]."""
+        times = test_time + np.arange(2 * 1440) * u.min
+        vis = Visibility(line1, line2)
+        pre = vis._precompute(times)
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+        illum = vis._get_earth_illumination_angle(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        assert illum.min() >= 0.0
+        assert illum.max() <= 180.0
+
+    def test_piecewise_array_shape(self):
+        """Array input returns an array of the same shape."""
+        illum = np.array([10.0, 85.0, 89.5, 95.0])
+        keepout = Visibility._dynamic_earthlimb_min_deg(illum)
+        assert keepout.shape == illum.shape
+        assert keepout[0] == pytest.approx(self.BRIGHT)
+        assert keepout[3] == pytest.approx(self.DARK)
+
+    # ── _get_earth_illumination_angle unit tests ────────────────────
+
+    def test_illumination_angle_with_limb_angle(self):
+        """Known geometry: target +X, zenith +Z, normal = cos(la)Z + sin(la)X."""
+        target = np.array([1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        la_rad = np.arccos(0.91)  # typical LEO value
+
+        # Sun overhead: n·sun = cos(la) = 0.91
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([0.0, 0.0, 1.0]), limb_angle_rad=la_rad
+        )) == pytest.approx(np.rad2deg(np.arccos(0.91)))
+
+        # Sun below: n·sun = -cos(la)
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([0.0, 0.0, -1.0]), limb_angle_rad=la_rad
+        )) == pytest.approx(180.0 - np.rad2deg(np.arccos(0.91)))
+
+        # Sun along the limb direction: n·sun = sin(la)
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([1.0, 0.0, 0.0]), limb_angle_rad=la_rad
+        )) == pytest.approx(np.rad2deg(np.arccos(np.sin(la_rad))))
+
+    def test_illumination_angle_legacy_fallback(self):
+        """Without limb_angle_rad the horizontal projection is used."""
+        target = np.array([1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([1.0, 0.0, 0.0])
+        )) == pytest.approx(0.0, abs=1e-6)
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([-1.0, 0.0, 0.0])
+        )) == pytest.approx(180.0)
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([0.0, 0.0, 1.0])
+        )) == pytest.approx(90.0)
+
+    def test_illumination_angle_array(self):
+        """Array inputs give one illumination angle per timestep."""
+        target = np.array([[1.0, 1.0], [0.0, 0.0], [0.0, 0.0]])
+        zenith = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]])
+        sun = np.array([[1.0, -1.0], [0.0, 0.0], [0.0, 0.0]])
+        angles = Visibility._get_earth_illumination_angle(target, zenith, sun)
+        assert angles.shape == (2,)
+        assert angles[0] == pytest.approx(0.0, abs=1e-6)
+        assert angles[1] == pytest.approx(180.0)
+
+    def test_illumination_angle_agrees_with_is_sunlit(self, line1, line2,
+                                                      target_coord, test_time):
+        """< 90 deg illumination is exactly the sunlit condition."""
+        times = test_time + np.arange(2 * 1440) * u.min
+        vis = Visibility(line1, line2)
+        pre = vis._precompute(times)
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+
+        illum = vis._get_earth_illumination_angle(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        sunlit = vis._earthlimb_is_sunlit(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        # Both are day and night in this window, so this is a real test
+        assert sunlit.any() and not sunlit.all()
+        np.testing.assert_array_equal(illum < 90.0, sunlit)
+
+    # ── Effective threshold ─────────────────────────────────────────
+
+    def test_effective_threshold_uses_dynamic_curve(self, line1, line2,
+                                                    target_coord, test_time):
+        """The effective threshold is the wedge curve of the illumination angle."""
+        times = test_time + np.arange(1440) * u.min
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        pre = vis._precompute(times)
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+
+        thresh = vis._effective_earthlimb_min_deg(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        illum = vis._get_earth_illumination_angle(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        np.testing.assert_allclose(
+            thresh, Visibility._dynamic_earthlimb_min_deg(illum)
+        )
+        # Over a full day the threshold varies and stays inside the curve
+        curve = Visibility._dynamic_earthlimb_min_deg(
+            np.linspace(0.0, 180.0, 18001)
+        )
+        assert thresh.min() >= curve.min()
+        assert thresh.max() <= curve.max()
+        assert thresh.max() - thresh.min() > 1.0
+        # The dark plateau is reached on the night side of every orbit
+        assert np.isclose(thresh, self.DARK).any()
+
+    def test_dynamic_overrides_day_night(self, line1, line2, target_coord,
+                                         test_time):
+        """use_dynamic_earthlimb takes precedence over the day/night pair."""
+        times = test_time + np.arange(500) * u.min
+        vis_dyn = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        vis_both = Visibility(
+            line1, line2,
+            use_dynamic_earthlimb=True,
+            earthlimb_day_min=90 * u.deg,
+            earthlimb_night_min=0 * u.deg,
+        )
+        np.testing.assert_array_equal(
+            vis_dyn.get_visibility(target_coord, times),
+            vis_both.get_visibility(target_coord, times),
+        )
+
+    # ── Integration with get_visibility ─────────────────────────────
+
+    def test_dynamic_bracketed_by_fixed_limits(self, line1, line2, target_coord,
+                                               test_time):
+        """Dynamic visibility sits between the flat bright and dark limits."""
+        times = test_time + np.arange(3 * 1440) * u.min
+        vis_dyn = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        vis_loose = Visibility(line1, line2, earthlimb_min=self.DARK * u.deg)
+        vis_tight = Visibility(line1, line2, earthlimb_min=self.BRIGHT * u.deg)
+
+        r_dyn = vis_dyn.get_visibility(target_coord, times)
+        r_loose = vis_loose.get_visibility(target_coord, times)
+        r_tight = vis_tight.get_visibility(target_coord, times)
+
+        assert np.all(r_dyn <= r_loose)
+        assert np.all(r_tight <= r_dyn)
+        # The dynamic curve is not degenerate to either bound
+        assert r_dyn.sum() < r_loose.sum()
+        assert r_dyn.sum() > r_tight.sum()
+
+    def test_dynamic_differs_from_default(self, line1, line2, target_coord,
+                                          test_time):
+        """The dynamic curve changes visibility versus the fixed 20 deg limit."""
+        times = test_time + np.arange(3 * 1440) * u.min
+        r_default = Visibility(line1, line2).get_visibility(target_coord, times)
+        r_dyn = Visibility(
+            line1, line2, use_dynamic_earthlimb=True
+        ).get_visibility(target_coord, times)
+        assert not np.array_equal(r_default, r_dyn)
+
+    def test_get_constraint_matches_manual_threshold(self, line1, line2,
+                                                     target_coord, test_time):
+        """get_constraint('earthlimb') applies the same dynamic threshold."""
+        times = test_time + np.arange(400) * u.min
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        pre = vis._precompute(times)
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+
+        illum = vis._get_earth_illumination_angle(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        actual = vis.get_separations(target_coord, times)["earthlimb"]
+        expected = (
+            actual.to(u.deg).value
+            >= Visibility._dynamic_earthlimb_min_deg(illum)
+        )
+        np.testing.assert_array_equal(
+            vis.get_constraint(target_coord, "earthlimb", times), expected
+        )
+
+    def test_get_constraint_scalar_time(self, line1, line2, target_coord,
+                                        test_time):
+        """Scalar times work through the get_constraint path."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        result = vis.get_constraint(target_coord, "earthlimb", test_time)
+        assert bool(result) in (True, False)
+
+    def test_best_roll_uses_dynamic(self, line1, line2, target_coord, test_time):
+        """The best-roll fast path applies the dynamic threshold too."""
+        times = test_time + np.arange(97) * u.min
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        result = vis.get_visibility_best_roll(target_coord, times)
+        np.testing.assert_array_equal(
+            result["boresight_visible"], vis.get_visibility(target_coord, times)
+        )
+
+    # ── repr / summary ──────────────────────────────────────────────
+
+    def test_repr_shows_dynamic(self, line1, line2):
+        """repr flags the dynamic limb keep-out."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        r = repr(vis)
+        assert "limb=dynamic" in r
+        assert "limb_day" not in r
+
+    def test_summary_shows_illumination(self, line1, line2, target_coord,
+                                        test_time):
+        """summary() reports the illumination angle driving the threshold."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        text = vis.summary(target_coord, test_time)
+        assert "illum" in text
+        assert "Earthlimb" in text
+
+
+class TestEarthlimbRegressionSpotChecks:
+    """Frozen results for the pre-existing (non-dynamic) limb paths.
+
+    These guard the day/night, twilight and default behaviour against
+    accidental changes made while extending the Earth limb constraint.
+    """
+
+    LINE1 = "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+    LINE2 = "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
+
+    @pytest.fixture
+    def times(self):
+        return Time("2026-06-01T00:00:00") + np.arange(3 * 1440) * u.min
+
+    @pytest.fixture
+    def wasp107(self):
+        return SkyCoord(188.386, -10.1462, frame="icrs", unit="deg")
+
+    @pytest.fixture
+    def south_target(self):
+        return SkyCoord(270.0, -66.0, frame="icrs", unit="deg")
+
+    @pytest.mark.parametrize("kwargs,expected", [
+        ({}, 2259),
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg), 2159),
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg,
+              daynight_mode="limb"), 2626),
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg,
+              twilight_margin=18 * u.deg), 1768),
+    ])
+    def test_visible_counts_unchanged(self, times, south_target, kwargs, expected):
+        """Visible-timestep counts for known configurations."""
+        vis = Visibility(self.LINE1, self.LINE2, **kwargs)
+        result = vis.get_visibility(south_target, times)
+        assert int(result.sum()) == expected
+
+    def test_default_wasp107_count(self, times, wasp107):
+        """Default constraints on WASP-107 over three days."""
+        vis = Visibility(self.LINE1, self.LINE2)
+        assert int(vis.get_visibility(wasp107, times).sum()) == 2297
+
+    def test_star_tracker_count(self, times, wasp107):
+        """Star-tracker-constrained visibility is unchanged."""
+        vis = Visibility(
+            self.LINE1, self.LINE2,
+            st_sun_min=44 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_moon_min=12 * u.deg,
+        )
+        assert int(vis.get_visibility(wasp107, times).sum()) == 1033

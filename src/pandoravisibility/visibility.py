@@ -9,6 +9,30 @@ __all__ = ["Visibility"]
 
 _R_EARTH_M = R_earth.to(u.m).value
 
+# DPC wedge keep-out: piecewise map from Earth illumination angle (deg) to
+# a keep-out angle measured from the Earth *centre* (deg).  Subtracting the
+# nominal Earth angular radius converts it to the limb-referenced angle used
+# everywhere else in this module.
+#
+# The curve is anchored at three points — (78, 110), (89, 82) and (90, 75) —
+# flat outside them and straight lines in between, so it is continuous.
+_DYN_EARTH_ANGULAR_RADIUS_DEG = 66.0
+_DYN_BRIGHT_ILLUM_DEG, _DYN_BRIGHT_KEEPOUT_DEG = 78.0, 110.0
+_DYN_KNEE_ILLUM_DEG, _DYN_KNEE_KEEPOUT_DEG = 89.0, 82.0
+_DYN_DARK_ILLUM_DEG, _DYN_DARK_KEEPOUT_DEG = 90.0, 75.0
+
+# Rule 1 (78 - 89 deg) and rule 2 (89 - 90 deg) linear fits through them
+_DYN_RULE1_M = (
+    (_DYN_KNEE_KEEPOUT_DEG - _DYN_BRIGHT_KEEPOUT_DEG)
+    / (_DYN_KNEE_ILLUM_DEG - _DYN_BRIGHT_ILLUM_DEG)
+)
+_DYN_RULE1_B = _DYN_BRIGHT_KEEPOUT_DEG - _DYN_RULE1_M * _DYN_BRIGHT_ILLUM_DEG
+_DYN_RULE2_M = (
+    (_DYN_DARK_KEEPOUT_DEG - _DYN_KNEE_KEEPOUT_DEG)
+    / (_DYN_DARK_ILLUM_DEG - _DYN_KNEE_ILLUM_DEG)
+)
+_DYN_RULE2_B = _DYN_KNEE_KEEPOUT_DEG - _DYN_RULE2_M * _DYN_KNEE_ILLUM_DEG
+
 
 def _validate_angle(value, name):
     """Raise TypeError if *value* is not an astropy angular Quantity."""
@@ -84,6 +108,7 @@ class Visibility:
     EARTHLIMB_DAY_MIN = None    # None = use EARTHLIMB_MIN
     EARTHLIMB_NIGHT_MIN = None  # None = use EARTHLIMB_MIN
     TWILIGHT_MARGIN = 0 * u.deg  # 0 = sharp terminator (current behaviour)
+    USE_DYNAMIC_EARTHLIMB = False  # True = DPC wedge keep-out vs illumination angle
     DAYNIGHT_MODE = "subsatellite"  # "limb" = nearest-limb-to-target; "subsatellite" = ground below spacecraft
     MARS_MIN = 0 * u.deg
     JUPITER_MIN = 0 * u.deg
@@ -145,6 +170,9 @@ class Visibility:
         self.twilight_margin = custom_limits.get(
             "twilight_margin", self.TWILIGHT_MARGIN
         )
+        self.use_dynamic_earthlimb = custom_limits.get(
+            "use_dynamic_earthlimb", self.USE_DYNAMIC_EARTHLIMB
+        )
         self.daynight_mode = custom_limits.get(
             "daynight_mode", self.DAYNIGHT_MODE
         )
@@ -189,7 +217,9 @@ class Visibility:
             constraints.append(f"moon≥{self.moon_min:.0f}")
         if self.sun_min > 0 * u.deg:
             constraints.append(f"sun≥{self.sun_min:.0f}")
-        if self.earthlimb_day_min is not None or self.earthlimb_night_min is not None:
+        if self.use_dynamic_earthlimb:
+            constraints.append("limb=dynamic")
+        elif self.earthlimb_day_min is not None or self.earthlimb_night_min is not None:
             day_lim = self.earthlimb_day_min if self.earthlimb_day_min is not None else self.earthlimb_min
             night_lim = self.earthlimb_night_min if self.earthlimb_night_min is not None else self.earthlimb_min
             constraints.append(f"limb_day≥{day_lim:.0f}")
@@ -338,8 +368,10 @@ class Visibility:
             limb_angle = self._get_angle_from_earth_limb(
                 observer_location, target_coord, time
             )
-            # Day/night-aware threshold
-            if self.earthlimb_day_min is not None or self.earthlimb_night_min is not None:
+            # Day/night-aware or illumination-dependent threshold
+            if (self.use_dynamic_earthlimb
+                    or self.earthlimb_day_min is not None
+                    or self.earthlimb_night_min is not None):
                 obs_gcrs = observer_location.get_gcrs(obstime=time)
                 obs_xyz = obs_gcrs.cartesian.xyz.to(u.m).value
                 if time.isscalar:
@@ -466,6 +498,115 @@ class Visibility:
         return dot_n_sun > threshold
 
     @staticmethod
+    def _get_earth_illumination_angle(target_unit, zenith_unit, sun_unit,
+                                      limb_angle_rad=None):
+        """Earth illumination angle at the nearest limb point, in degrees.
+
+        This is the solar zenith angle at the Earth surface point the
+        boresight grazes: the angle between that point's outward surface
+        normal and the direction to the Sun.  0 deg is the subsolar point
+        (brightest limb), 90 deg is the terminator, 180 deg is the
+        antisolar point (fully dark limb).
+
+        The surface normal is built exactly as in ``_earthlimb_is_sunlit``,
+
+            n = cos(limb_angle) * zenith  +  sin(limb_angle) * limb_dir
+
+        Parameters
+        ----------
+        target_unit : ndarray, shape (3,) or (3, N)
+            Target direction unit vector(s) in GCRS.
+        zenith_unit : ndarray, shape (3,) or (3, N)
+            Observer zenith direction unit vector(s).
+        sun_unit : ndarray, shape (3,) or (3, N)
+            Sun direction unit vector(s).
+        limb_angle_rad : float or ndarray or None
+            Earth-limb half-angle in radians (``arccos(R_earth / d)``).
+            When *None*, falls back to a simple horizontal projection
+            (ignoring the zenith component of the surface normal).
+
+        Returns
+        -------
+        float or ndarray
+            Illumination angle in degrees, in [0, 180].
+        """
+        dot_tz = np.sum(target_unit * zenith_unit, axis=0)
+        if target_unit.ndim == 1:
+            proj = target_unit - zenith_unit * dot_tz
+        else:
+            proj = target_unit - zenith_unit * dot_tz[np.newaxis, :]
+        proj_norm = np.linalg.norm(proj, axis=0, keepdims=True)
+        limb_unit = proj / np.where(proj_norm < 1e-12, 1.0, proj_norm)
+
+        if limb_angle_rad is None:
+            # Legacy fallback: horizontal projection only
+            dot_n_sun = np.sum(limb_unit * sun_unit, axis=0)
+        else:
+            dot_n_sun = (
+                np.cos(limb_angle_rad) * np.sum(zenith_unit * sun_unit, axis=0)
+                + np.sin(limb_angle_rad) * np.sum(limb_unit * sun_unit, axis=0)
+            )
+        return np.rad2deg(np.arccos(np.clip(dot_n_sun, -1.0, 1.0)))
+
+    @staticmethod
+    def _dynamic_earthlimb_min_deg(illumination_deg):
+        """DPC wedge keep-out in degrees above the limb.
+
+        Piecewise function of the Earth illumination angle (see
+        ``_get_earth_illumination_angle``), given from the Earth centre as
+
+        ===================  ===========================
+        Illumination angle   Keep-out from Earth centre
+        ===================  ===========================
+        <= 78 deg            110 deg
+        78 - 89 deg          linear rule 1 (110 → 82 deg)
+        89 - 90 deg          linear rule 2 (82 → 75 deg)
+        >= 90 deg            75 deg
+        ===================  ===========================
+
+        Both rules are straight lines through the anchor points, so the
+        curve is continuous at 78, 89 and 90 deg.
+
+        The nominal Earth angular radius (66 deg) is subtracted so the
+        result is referenced to the limb like every other Earth limb
+        angle in this class.
+
+        The input is wrapped into [0, 180] first, so the curve is
+        symmetric about the sub-solar and anti-solar directions: -78,
+        +78 and +282 deg all give the same keep-out.
+
+        Parameters
+        ----------
+        illumination_deg : float or ndarray
+            Earth illumination angle(s) in degrees.  Any angle is
+            accepted; it is folded into [0, 180] before evaluation.
+
+        Returns
+        -------
+        float or ndarray
+            Minimum allowed angle above the Earth limb, in degrees.
+        """
+        # Fold onto [0, 180]: the keep-out depends only on how far the
+        # limb point is from the sub-solar direction, not on which side.
+        illum = np.abs(
+            (np.asarray(illumination_deg, dtype=float) + 180.0) % 360.0 - 180.0
+        )
+        keepout = np.where(
+            illum < _DYN_BRIGHT_ILLUM_DEG,
+            _DYN_BRIGHT_KEEPOUT_DEG,
+            np.where(
+                illum <= _DYN_KNEE_ILLUM_DEG,
+                _DYN_RULE1_M * illum + _DYN_RULE1_B,
+                np.where(
+                    illum < _DYN_DARK_ILLUM_DEG,
+                    _DYN_RULE2_M * illum + _DYN_RULE2_B,
+                    _DYN_DARK_KEEPOUT_DEG,
+                ),
+            ),
+        )
+        return keepout - _DYN_EARTH_ANGULAR_RADIUS_DEG
+
+    @staticmethod
     def _subsatellite_is_sunlit(zenith_unit, sun_unit,
                                 twilight_margin_deg=0.0):
         """Whether the subsatellite point (ground below spacecraft) is sunlit.
@@ -500,7 +641,11 @@ class Visibility:
                                      limb_angle_rad=None):
         """Per-timestep effective Earth limb threshold in degrees.
 
-        When ``earthlimb_day_min`` or ``earthlimb_night_min`` is set,
+        When ``use_dynamic_earthlimb`` is True, the threshold follows the
+        DPC wedge keep-out curve as a function of the Earth illumination
+        angle and everything below is bypassed.
+
+        Otherwise, when ``earthlimb_day_min`` or ``earthlimb_night_min`` is set,
         returns a scalar or array of thresholds that depend on whether
         the observer is over sunlit or shadowed Earth.  The method used
         to determine day/night is controlled by ``self.daynight_mode``:
@@ -516,6 +661,17 @@ class Visibility:
             Earth-limb half-angle in radians, forwarded to
             ``_earthlimb_is_sunlit``.
         """
+        if self.use_dynamic_earthlimb:
+            # DPC wedge: continuous threshold from the illumination angle
+            # at the nearest limb point.  Takes precedence over the
+            # day/night pair.
+            return self._dynamic_earthlimb_min_deg(
+                self._get_earth_illumination_angle(
+                    target_unit, zenith_unit, sun_unit,
+                    limb_angle_rad=limb_angle_rad,
+                )
+            )
+
         if self.earthlimb_day_min is None and self.earthlimb_night_min is None:
             return self.earthlimb_min.to(u.deg).value
 
@@ -1833,10 +1989,11 @@ class Visibility:
             actual_sep = separations[body]
 
             if body == "earthlimb" and (
-                self.earthlimb_day_min is not None
+                self.use_dynamic_earthlimb
+                or self.earthlimb_day_min is not None
                 or self.earthlimb_night_min is not None
             ):
-                # Show day/night thresholds and which is active
+                # Show the active threshold and how it was chosen
                 day_lim = (
                     self.earthlimb_day_min
                     if self.earthlimb_day_min is not None
@@ -1861,12 +2018,21 @@ class Visibility:
                 obs_dist = np.linalg.norm(obs_xyz)
                 with np.errstate(invalid="ignore"):
                     la_rad = np.arccos(_R_EARTH_M / obs_dist)
-                is_sunlit = bool(self._earthlimb_is_sunlit(
-                    tgt_u, zenith_u, sun_u, limb_angle_rad=la_rad,
-                    twilight_margin_deg=self.twilight_margin.to(u.deg).value,
-                ))
-                side = "day" if is_sunlit else "night"
-                eff_lim = day_lim if is_sunlit else night_lim
+                if self.use_dynamic_earthlimb:
+                    illum = float(self._get_earth_illumination_angle(
+                        tgt_u, zenith_u, sun_u, limb_angle_rad=la_rad,
+                    ))
+                    side = f"illum {illum:.1f}°"
+                    eff_lim = float(
+                        self._dynamic_earthlimb_min_deg(illum)
+                    ) * u.deg
+                else:
+                    is_sunlit = bool(self._earthlimb_is_sunlit(
+                        tgt_u, zenith_u, sun_u, limb_angle_rad=la_rad,
+                        twilight_margin_deg=self.twilight_margin.to(u.deg).value,
+                    ))
+                    side = "day" if is_sunlit else "night"
+                    eff_lim = day_lim if is_sunlit else night_lim
                 lines.append(
                     f"{body.capitalize():<10} {status_symbol} {status:<4} "
                     f"(req: {eff_lim:>6.1f} [{side}], actual: {actual_sep:>6.1f})"
