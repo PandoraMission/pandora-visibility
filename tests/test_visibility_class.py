@@ -2108,6 +2108,357 @@ class TestDynamicEarthlimb:
         assert "Earthlimb" in text
 
 
+class TestEphemerisStepAndCaching:
+    """Tests for ephemeris_step interpolation and the precompute caches."""
+
+    @pytest.fixture
+    def line1(self):
+        return "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+
+    @pytest.fixture
+    def line2(self):
+        return "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
+
+    @pytest.fixture
+    def kwargs(self):
+        return dict(
+            earthlimb_day_min=44 * u.deg,
+            earthlimb_night_min=13 * u.deg,
+            st_sun_min=50 * u.deg,
+            st_moon_min=20 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_required=1,
+        )
+
+    @pytest.fixture
+    def targets(self):
+        return [
+            SkyCoord(188.386, -10.1462, frame="icrs", unit="deg"),
+            SkyCoord(79.17, 45.99, frame="icrs", unit="deg"),
+        ]
+
+    @pytest.fixture
+    def times(self):
+        return Time("2026-06-01T00:00:00") + np.arange(600) * u.min
+
+    # ── ephemeris_step ──────────────────────────────────────────────
+
+    def test_default_is_none(self, line1, line2):
+        """ephemeris_step defaults to None, i.e. an exact ephemeris."""
+        assert Visibility(line1, line2).ephemeris_step is None
+
+    def test_stored(self, line1, line2):
+        """A custom ephemeris_step is stored on the instance."""
+        vis = Visibility(line1, line2, ephemeris_step=30 * u.min)
+        assert vis.ephemeris_step == 30 * u.min
+
+    def test_requires_time_units(self, line1, line2):
+        """A bare number, or an angle, is rejected."""
+        with pytest.raises(TypeError, match="astropy Quantity"):
+            Visibility(line1, line2, ephemeris_step=30)
+        with pytest.raises(u.UnitsError, match="time units"):
+            Visibility(line1, line2, ephemeris_step=30 * u.deg)
+
+    def test_interpolated_bodies_match_exact(self, line1, line2, times):
+        """Interpolated body directions agree with the exact ephemeris."""
+        exact = Visibility(line1, line2)._precompute(times)
+        interp = Visibility(
+            line1, line2, ephemeris_step=60 * u.min
+        )._precompute(times)
+
+        for name in ("sun", "moon"):
+            dot = np.sum(exact["body_units"][name] * interp["body_units"][name],
+                         axis=0)
+            offset = np.rad2deg(np.arccos(np.clip(dot, -1.0, 1.0)))
+            # Tens of degrees of keep-out; this must be far below that
+            assert offset.max() < 0.01, f"{name} off by {offset.max()} deg"
+
+        # The satellite-dependent quantities are untouched by interpolation
+        np.testing.assert_array_equal(exact["zenith_unit"],
+                                      interp["zenith_unit"])
+        np.testing.assert_array_equal(exact["limb_angle_rad"],
+                                      interp["limb_angle_rad"])
+
+    def test_interpolation_does_not_change_visibility(self, line1, line2,
+                                                      kwargs, targets, times):
+        """get_visibility is unchanged by the interpolated ephemeris."""
+        exact = Visibility(line1, line2, **kwargs)
+        interp = Visibility(line1, line2, ephemeris_step=60 * u.min, **kwargs)
+        for target in targets:
+            np.testing.assert_array_equal(
+                exact.get_visibility(target, times),
+                interp.get_visibility(target, times),
+            )
+
+    def test_interpolation_does_not_change_best_roll(self, line1, line2,
+                                                     kwargs, targets, times):
+        """The best-roll decisions are unchanged by the interpolated ephemeris."""
+        exact = Visibility(line1, line2, **kwargs)
+        interp = Visibility(line1, line2, ephemeris_step=60 * u.min, **kwargs)
+        for target in targets:
+            a = exact.get_visibility_best_roll(target, times)
+            b = interp.get_visibility_best_roll(target, times)
+            for key in ("visible", "boresight_visible", "n_st_pass"):
+                np.testing.assert_array_equal(np.asarray(a[key]),
+                                              np.asarray(b[key]))
+            np.testing.assert_array_equal(np.isnan(a["roll_deg"]),
+                                          np.isnan(b["roll_deg"]))
+            good = ~np.isnan(a["roll_deg"])
+            np.testing.assert_array_equal(a["roll_deg"][good],
+                                          b["roll_deg"][good])
+
+    def test_scalar_time_ignores_interpolation(self, line1, line2, kwargs,
+                                               targets):
+        """A scalar time is always evaluated exactly."""
+        moment = Time("2026-06-01T03:00:00")
+        exact = Visibility(line1, line2, **kwargs)
+        interp = Visibility(line1, line2, ephemeris_step=60 * u.min, **kwargs)
+        assert (exact.get_visibility(targets[0], moment)
+                == interp.get_visibility(targets[0], moment))
+
+    # ── precompute cache ────────────────────────────────────────────
+
+    def test_precompute_cache_hits_same_object(self, line1, line2, times):
+        """The same Time object is served from the cache."""
+        vis = Visibility(line1, line2)
+        first = vis._precompute(times)
+        assert vis._precompute(times) is first
+
+    def test_precompute_cache_misses_other_times(self, line1, line2, times):
+        """A different grid must never be served the cached entry.
+
+        The cache used to key on ``id(time)``, which CPython recycles once
+        the original is collected, so a later grid could land on a dead
+        entry's address and be served its data.
+        """
+        vis = Visibility(line1, line2)
+        first = vis._precompute(times)
+        zenith_first = first["zenith_unit"].copy()
+
+        # Drop the reference and build a new grid, which may well land on
+        # the freed address.
+        other = Time("2026-07-15T00:00:00") + np.arange(600) * u.min
+        second = vis._precompute(other)
+        assert second is not first
+        assert not np.allclose(second["zenith_unit"], zenith_first)
+
+        # Recomputing the original grid still gives the original answer
+        again = Visibility(line1, line2)._precompute(times)
+        np.testing.assert_allclose(again["zenith_unit"], zenith_first)
+
+    def test_orbit_grid_shared_between_targets(self, line1, line2, kwargs,
+                                               targets, times):
+        """The orbit sampling grid is built once and reused per target."""
+        vis = Visibility(line1, line2, **kwargs)
+        vis.get_visibility_best_roll(targets[0], times)
+        grid = vis._orbit_grid_cache_value
+        assert grid is not None
+
+        vis.get_visibility_best_roll(targets[1], times)
+        assert vis._orbit_grid_cache_value is grid, (
+            "the second target rebuilt the target-independent orbit grid"
+        )
+
+    def test_orbit_grid_rebuilt_for_new_times(self, line1, line2, kwargs,
+                                              targets, times):
+        """A different time grid or orbit step invalidates the cache."""
+        vis = Visibility(line1, line2, **kwargs)
+        vis.get_visibility_best_roll(targets[0], times)
+        grid = vis._orbit_grid_cache_value
+
+        vis.get_visibility_best_roll(targets[0], times[:200])
+        assert vis._orbit_grid_cache_value is not grid
+
+        grid = vis._orbit_grid_cache_value
+        vis.get_visibility_best_roll(targets[0], times[:200],
+                                     orbit_time_step=5 * u.min)
+        assert vis._orbit_grid_cache_value is not grid
+
+    def test_orbit_grid_layout(self, line1, line2, kwargs, times):
+        """Orbit windows are laid out contiguously, one block per orbit."""
+        vis = Visibility(line1, line2, **kwargs)
+        grid = vis._orbit_sampling_grid(times, 1 * u.min)
+        n_orbits = len(grid["orbit_ids"])
+        n_samp = grid["n_orbit_samp"]
+
+        assert grid["pre_orbit_all"]["zenith_unit"].shape == (3, n_orbits * n_samp)
+        assert grid["pre_input_all"]["zenith_unit"].shape == (3, len(times))
+        assert len(grid["chunk_indices"]) == n_orbits
+        # every input timestep belongs to exactly one orbit
+        covered = np.concatenate(grid["chunk_indices"])
+        np.testing.assert_array_equal(np.sort(covered), np.arange(len(times)))
+
+    # ── vectorised roll attitude ────────────────────────────────────
+
+    def test_roll_attitude_batch_matches_scalar(self):
+        """_roll_attitude_batch reproduces _roll_attitude for every angle."""
+        z_unit = np.array([0.3, -0.5, 0.81])
+        z_unit = z_unit / np.linalg.norm(z_unit)
+        rolls = np.deg2rad(np.arange(0, 360, 2.0))
+
+        x_all, y_all = Visibility._roll_attitude_batch(z_unit, rolls)
+        assert x_all.shape == (len(rolls), 3)
+        for i, roll in enumerate(rolls):
+            x_one, y_one = Visibility._roll_attitude(z_unit, roll)
+            np.testing.assert_allclose(x_all[i], x_one, atol=1e-14)
+            np.testing.assert_allclose(y_all[i], y_one, atol=1e-14)
+
+    def test_roll_attitude_batch_near_pole(self):
+        """The celestial-pole fallback is applied in the batch version too."""
+        z_unit = np.array([0.0, 0.0, 1.0])
+        rolls = np.deg2rad(np.array([0.0, 90.0, 180.0]))
+        x_all, y_all = Visibility._roll_attitude_batch(z_unit, rolls)
+        for i, roll in enumerate(rolls):
+            x_one, y_one = Visibility._roll_attitude(z_unit, roll)
+            np.testing.assert_allclose(x_all[i], x_one, atol=1e-14)
+            np.testing.assert_allclose(y_all[i], y_one, atol=1e-14)
+
+
+class TestConstraintApiConsistency:
+    """The diagnostic API must agree with get_visibility, body for body."""
+
+    LINE1 = "1 67395U 80229J   26212.76861111  .00000000  00000-0  37770-3 0    05"
+    LINE2 = "2 67395  97.8073 210.7389 0004787   3.5990  91.5851 14.88172851    02"
+
+    @pytest.fixture
+    def vis(self):
+        return Visibility(
+            self.LINE1, self.LINE2,
+            earthlimb_day_min=44 * u.deg,
+            earthlimb_night_min=13 * u.deg,
+            sun_min=91 * u.deg,
+            moon_min=20 * u.deg,
+            st_sun_min=50 * u.deg,
+            st_moon_min=20 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_required=1,
+        )
+
+    @pytest.fixture
+    def times(self):
+        return Time("2026-08-10T00:00:00") + np.arange(500) * u.min
+
+    @pytest.fixture
+    def target_coord(self):
+        return SkyCoord(330.795, 18.884, frame="icrs", unit="deg")
+
+    def test_every_invisible_step_is_explained(self, vis, target_coord, times):
+        """No step may be invisible without some constraint failing.
+
+        The two used to disagree because the diagnostics went through the
+        astropy path while get_visibility used the vector path.
+        """
+        visible = np.asarray(vis.get_visibility(target_coord, times))
+        constraints = vis.get_all_constraints(target_coord, times)
+
+        failing = np.zeros(len(times), dtype=bool)
+        for passed in constraints.values():
+            failing |= ~np.asarray(passed)
+
+        assert not np.any(~visible & ~failing), (
+            f"{int(np.sum(~visible & ~failing))} invisible steps that no "
+            f"individual constraint explains"
+        )
+
+    def test_all_constraints_passing_means_visible(self, vis, target_coord,
+                                                   times):
+        """The converse: if every constraint passes the target is visible."""
+        visible = np.asarray(vis.get_visibility(target_coord, times))
+        constraints = vis.get_all_constraints(target_coord, times)
+
+        all_pass = np.ones(len(times), dtype=bool)
+        for passed in constraints.values():
+            all_pass &= np.asarray(passed)
+
+        np.testing.assert_array_equal(all_pass & ~visible,
+                                      np.zeros(len(times), dtype=bool))
+
+    def test_star_tracker_constraint_matches_visibility(self, vis, target_coord,
+                                                        times):
+        """The ST diagnostic uses the same path as get_visibility."""
+        pre = vis._precompute(times)
+        target_unit = vis._target_unit(target_coord, times)[:, 0].copy()
+        np.testing.assert_array_equal(
+            np.asarray(vis.get_star_tracker_constraint(target_coord, times)),
+            np.asarray(vis._get_st_constraint_fast(target_unit, times, pre)),
+        )
+
+    def test_earthlimb_separation_matches_visibility_math(self, vis,
+                                                          target_coord, times):
+        """The reported limb angle is the one the constraint is applied to.
+
+        Both are geocentric now; get_separations used to return an AltAz
+        altitude, which is referenced to the geodetic horizon and so
+        differed from the constraint by up to 0.1 deg.
+        """
+        pre = vis._precompute(times)
+        target_unit = vis._target_unit(target_coord, times)
+        expected = vis._fast_limb_deg(
+            target_unit, pre["zenith_unit"], pre["limb_angle_rad"]
+        )
+        separations = vis.get_separations(target_coord, times)
+        np.testing.assert_allclose(
+            separations["earthlimb"].to(u.deg).value, expected
+        )
+
+    def test_separations_agree_with_constraints(self, vis, target_coord, times):
+        """A body constraint passes exactly when its separation clears the limit."""
+        separations = vis.get_separations(target_coord, times)
+        for body, limit in (("moon", vis.moon_min), ("sun", vis.sun_min)):
+            np.testing.assert_array_equal(
+                np.asarray(vis.get_constraint(target_coord, body, times)),
+                separations[body] >= limit,
+            )
+
+    # ── precompute reuse ────────────────────────────────────────────
+
+    def test_all_constraints_precomputes_once(self, vis, target_coord, times,
+                                              monkeypatch):
+        """One set of ephemeris/SGP4 results covers every body."""
+        calls = []
+        original = Visibility._precompute
+
+        def counted(self, time):
+            calls.append(time)
+            return original(self, time)
+
+        monkeypatch.setattr(Visibility, "_precompute", counted)
+        vis.get_all_constraints(target_coord, times)
+        assert len(calls) == 1, f"_precompute called {len(calls)} times"
+
+    def test_constraint_accepts_precomputed_data(self, vis, target_coord, times):
+        """Passing `pre` gives the same answer as letting it compute one."""
+        pre = vis._precompute(times)
+        for body in ("moon", "sun", "earthlimb"):
+            np.testing.assert_array_equal(
+                np.asarray(vis.get_constraint(target_coord, body, times)),
+                np.asarray(vis.get_constraint(target_coord, body, times,
+                                              pre=pre)),
+            )
+
+    def test_disabled_planet_still_queryable(self, vis, target_coord, times):
+        """mars/jupiter can be asked for even when their keep-out is off.
+
+        _precompute only carries the planets whose limit is active, so this
+        exercises the ephemeris fallback.
+        """
+        assert vis.mars_min == 0 * u.deg
+        result = np.asarray(vis.get_constraint(target_coord, "mars", times))
+        assert result.shape == (len(times),)
+        assert result.all()  # a 0 deg keep-out passes everywhere
+
+        separations = vis.get_separations(target_coord, times)
+        assert separations["mars"].unit.is_equivalent(u.deg)
+        assert np.all(separations["mars"].to(u.deg).value >= 0)
+
+    def test_summary_still_renders(self, vis, target_coord, times):
+        """summary() works off the shared precompute."""
+        text = vis.summary(target_coord, times[0])
+        assert "Visibility Summary" in text
+        assert "Earthlimb" in text
+        assert "Star Tracker Constraints" in text
+
+
 class TestEarthlimbRegressionSpotChecks:
     """Frozen results for the pre-existing (non-dynamic) limb paths.
 
