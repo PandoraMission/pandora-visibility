@@ -1706,14 +1706,6 @@ class Visibility:
             checks.append(("limb", limb_min, "earthlimb_angle"))
         return checks
 
-    @property
-    def _st_checks(self) -> list:
-        """Active star tracker constraint checks using shared limits.
-
-        .. deprecated:: Use ``_st_checks_for(tracker)`` for per-tracker limits.
-        """
-        return self._st_checks_for(1)  # backward compat: same as tracker 1
-
     @staticmethod
     def _get_star_tracker_body_xyz(tracker: int) -> tuple:
         """
