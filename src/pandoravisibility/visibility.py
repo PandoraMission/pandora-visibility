@@ -688,6 +688,48 @@ class Visibility:
         dot_zs = np.sum(zenith_unit * sun_unit, axis=0)
         return dot_zs > threshold
 
+    def _daynight_is_sunlit(self, target_unit, zenith_unit, sun_unit,
+                            limb_angle_rad=None):
+        """Whether the Earth below counts as sunlit, per ``daynight_mode``.
+
+        The single source of truth for the day/night split, so the
+        threshold applied by ``_effective_earthlimb_min_deg`` and the
+        ``[day]``/``[night]`` label printed by ``summary`` can never
+        disagree.
+
+        * ``"subsatellite"`` (default): the ground directly below the
+          spacecraft, independent of where the boresight points.
+        * ``"limb"``: the nearest limb point to the target direction.
+
+        Parameters
+        ----------
+        target_unit : ndarray, shape (3,) or (3, N)
+            Target direction unit vector(s) in GCRS.  Unused in
+            ``"subsatellite"`` mode.
+        zenith_unit : ndarray, shape (3,) or (3, N)
+            Observer zenith direction unit vector(s).
+        sun_unit : ndarray, shape (3,) or (3, N)
+            Sun direction unit vector(s).
+        limb_angle_rad : float or ndarray or None
+            Earth-limb half-angle in radians.  Only used in ``"limb"`` mode.
+
+        Returns
+        -------
+        bool or ndarray of bool
+            True where the relevant Earth point is sunlit.
+        """
+        twilight_deg = self.twilight_margin.to(u.deg).value
+        if self.daynight_mode == "subsatellite":
+            return self._subsatellite_is_sunlit(
+                zenith_unit, sun_unit,
+                twilight_margin_deg=twilight_deg,
+            )
+        return self._earthlimb_is_sunlit(
+            target_unit, zenith_unit, sun_unit,
+            limb_angle_rad=limb_angle_rad,
+            twilight_margin_deg=twilight_deg,
+        )
+
     def _effective_earthlimb_min_deg(self, target_unit, zenith_unit, sun_unit,
                                      limb_angle_rad=None):
         """Per-timestep effective Earth limb threshold in degrees.
@@ -737,19 +779,10 @@ class Visibility:
             else self.earthlimb_min.to(u.deg).value
         )
 
-        twilight_deg = self.twilight_margin.to(u.deg).value
-
-        if self.daynight_mode == "subsatellite":
-            sunlit = self._subsatellite_is_sunlit(
-                zenith_unit, sun_unit,
-                twilight_margin_deg=twilight_deg,
-            )
-        else:
-            sunlit = self._earthlimb_is_sunlit(
-                target_unit, zenith_unit, sun_unit,
-                limb_angle_rad=limb_angle_rad,
-                twilight_margin_deg=twilight_deg,
-            )
+        sunlit = self._daynight_is_sunlit(
+            target_unit, zenith_unit, sun_unit,
+            limb_angle_rad=limb_angle_rad,
+        )
         return np.where(sunlit, day_deg, night_deg)
 
     def _active_bodies(self) -> list:
@@ -2230,9 +2263,12 @@ class Visibility:
                         self._dynamic_earthlimb_min_deg(illum)
                     ) * u.deg
                 else:
-                    is_sunlit = bool(self._earthlimb_is_sunlit(
+                    # Must go through _daynight_is_sunlit, not
+                    # _earthlimb_is_sunlit directly, so the reported
+                    # threshold is the one get_visibility actually applied
+                    # under the active daynight_mode.
+                    is_sunlit = bool(self._daynight_is_sunlit(
                         tgt_u, zenith_u, sun_u, limb_angle_rad=la_rad,
-                        twilight_margin_deg=self.twilight_margin.to(u.deg).value,
                     ))
                     side = "day" if is_sunlit else "night"
                     eff_lim = day_lim if is_sunlit else night_lim

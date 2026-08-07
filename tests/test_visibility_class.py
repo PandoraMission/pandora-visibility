@@ -1440,6 +1440,70 @@ class TestEarthlimbDayNight:
         summary = vis.summary(target_coord, test_time)
         assert "[day]" in summary or "[night]" in summary
 
+    @pytest.mark.parametrize("mode", ["subsatellite", "limb"])
+    def test_summary_threshold_matches_engine(self, line1, line2, mode):
+        """The req: value summary prints is the one get_visibility applied.
+
+        summary() used to derive day/night from the nearest limb point
+        regardless of daynight_mode, so in the default "subsatellite" mode
+        it could report the night limit while the engine applied the day
+        limit (or vice versa).
+        """
+        day_min, night_min = 40 * u.deg, 5 * u.deg
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=day_min,
+            earthlimb_night_min=night_min,
+            daynight_mode=mode,
+        )
+        target = SkyCoord(ra=90, dec=-30, unit="deg")
+
+        checked = 0
+        for i in range(0, 200, 5):
+            time = Time("2026-02-15T18:00:00") + i * u.min
+            pre = vis._precompute(time)
+            tgt_u = vis._target_unit(target, time)
+            engine_deg = float(vis._effective_earthlimb_min_deg(
+                tgt_u, pre["zenith_unit"], pre["body_units"]["sun"],
+                limb_angle_rad=pre["limb_angle_rad"],
+            ))
+            expected_side = "day" if engine_deg == day_min.value else "night"
+
+            line = next(
+                ln for ln in vis.summary(target, time).split("\n")
+                if ln.startswith("Earthlimb")
+            )
+            assert f"[{expected_side}]" in line, (
+                f"{mode} mode at {time.iso}: engine used {engine_deg} deg "
+                f"but summary reported: {line.strip()}"
+            )
+            assert f"{engine_deg:>6.1f} deg" in line, (
+                f"{mode} mode at {time.iso}: engine used {engine_deg} deg "
+                f"but summary reported: {line.strip()}"
+            )
+            checked += 1
+
+        assert checked == 40
+
+    def test_daynight_is_sunlit_follows_mode(self, line1, line2):
+        """_daynight_is_sunlit dispatches on daynight_mode.
+
+        Geometry chosen so the two modes disagree: the spacecraft is over
+        sunlit ground, but the limb point toward the target is dark.
+        """
+        target = np.array([-1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        sun = np.array([0.995, 0.0, 0.0999])  # low sun, 84 deg off zenith
+        limb_rad = np.deg2rad(21.0)
+
+        vis_sub = Visibility(line1, line2, daynight_mode="subsatellite")
+        vis_limb = Visibility(line1, line2, daynight_mode="limb")
+
+        assert bool(vis_sub._daynight_is_sunlit(
+            target, zenith, sun, limb_angle_rad=limb_rad)) is True
+        assert bool(vis_limb._daynight_is_sunlit(
+            target, zenith, sun, limb_angle_rad=limb_rad)) is False
+
     # ── Fallback behavior ───────────────────────────────────────────
 
     def test_only_day_set_falls_back_to_earthlimb_min(self, line1, line2):
