@@ -109,7 +109,13 @@ class Visibility:
     EARTHLIMB_NIGHT_MIN = None  # None = use EARTHLIMB_MIN
     TWILIGHT_MARGIN = 0 * u.deg  # 0 = sharp terminator (current behaviour)
     USE_DYNAMIC_EARTHLIMB = False  # True = DPC wedge keep-out vs illumination angle
-    DAYNIGHT_MODE = "subsatellite"  # "limb" = nearest-limb-to-target; "subsatellite" = ground below spacecraft
+    # "limb" = nearest-limb-to-target; "subsatellite" = ground below spacecraft.
+    # "limb" is the default because the stray light that motivates the day/night
+    # split comes from the patch of Earth the boresight grazes, not from the
+    # ground beneath the spacecraft.  It is also what the dynamic DPC wedge
+    # (``use_dynamic_earthlimb``) measures, so the two Earth limb models agree.
+    # Set "subsatellite" for a target-independent, orbit-only day/night split.
+    DAYNIGHT_MODE = "limb"
     MARS_MIN = 0 * u.deg
     JUPITER_MIN = 0 * u.deg
 
@@ -255,7 +261,9 @@ class Visibility:
             night_lim = self.earthlimb_night_min if self.earthlimb_night_min is not None else self.earthlimb_min
             constraints.append(f"limb_day≥{day_lim:.0f}")
             constraints.append(f"limb_night≥{night_lim:.0f}")
-            if self.daynight_mode != "subsatellite" or self.twilight_margin > 0 * u.deg:
+            # Compare against the class default so this stays correct if the
+            # default changes again, or a subclass picks a different one.
+            if self.daynight_mode != self.DAYNIGHT_MODE or self.twilight_margin > 0 * u.deg:
                 constraints.append(f"daynight={self.daynight_mode}")
             if self.twilight_margin > 0 * u.deg:
                 constraints.append(f"twilight_margin={self.twilight_margin:.0f}")
@@ -697,9 +705,10 @@ class Visibility:
         ``[day]``/``[night]`` label printed by ``summary`` can never
         disagree.
 
-        * ``"subsatellite"`` (default): the ground directly below the
-          spacecraft, independent of where the boresight points.
-        * ``"limb"``: the nearest limb point to the target direction.
+        * ``"limb"`` (default): the nearest limb point to the target
+          direction — the patch of Earth the boresight actually grazes.
+        * ``"subsatellite"``: the ground directly below the spacecraft,
+          independent of where the boresight points.
 
         Parameters
         ----------
@@ -743,8 +752,8 @@ class Visibility:
         the observer is over sunlit or shadowed Earth.  The method used
         to determine day/night is controlled by ``self.daynight_mode``:
 
-        * ``"subsatellite"`` (default): subsatellite point directly below spacecraft.
-        * ``"limb"``: nearest limb point to the target direction.
+        * ``"limb"`` (default): nearest limb point to the target direction.
+        * ``"subsatellite"``: subsatellite point directly below spacecraft.
 
         Otherwise returns a plain scalar from ``earthlimb_min``.
 

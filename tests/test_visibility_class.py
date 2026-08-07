@@ -1643,13 +1643,29 @@ class TestEarthlimbDayNight:
         )
         assert vis.earthlimb_night_min == 5 * u.deg
         assert vis.earthlimb_day_min is None
-        # Day threshold should use earthlimb_min
-        # Sun aligned with zenith so subsatellite point is sunlit (day)
+
+    @pytest.mark.parametrize("mode,sun_lit", [
+        # Sun along the zenith: the ground below the spacecraft is sunlit.
+        ("subsatellite", np.array([0.0, 0.0, 1.0])),
+        # Sun along the target's horizontal direction: the limb the
+        # boresight grazes is sunlit.
+        ("limb", np.array([1.0, 0.0, 0.0])),
+    ])
+    def test_day_falls_back_to_earthlimb_min(self, line1, line2, mode, sun_lit):
+        """With only night set, the day threshold uses earthlimb_min.
+
+        Checked in both day/night modes with a geometry that reads as day
+        for that mode, so the fallback is covered whichever is default.
+        """
+        vis = Visibility(
+            line1, line2,
+            earthlimb_night_min=5 * u.deg,
+            daynight_mode=mode,
+        )
         target = np.array([1.0, 0.0, 0.0])
         zenith = np.array([0.0, 0.0, 1.0])
-        sun_lit = np.array([0.0, 0.0, 1.0])
         eff = vis._effective_earthlimb_min_deg(target, zenith, sun_lit)
-        assert float(eff) == pytest.approx(20.0)
+        assert float(eff) == pytest.approx(20.0)  # earthlimb_min default
 
     # ── Array time ──────────────────────────────────────────────────
 
@@ -1785,10 +1801,17 @@ class TestEarthlimbDayNight:
 
     # ── daynight_mode / subsatellite ────────────────────────────────
 
-    def test_daynight_mode_default_is_subsatellite(self, line1, line2):
-        """Default daynight_mode is 'subsatellite'."""
+    def test_daynight_mode_default_is_limb(self, line1, line2):
+        """Default daynight_mode is 'limb'.
+
+        The day/night split exists to model stray light from the sunlit
+        Earth, which comes from the patch the boresight grazes — so the
+        default matches the dynamic DPC wedge rather than the orbit-only
+        subsatellite test.
+        """
         vis = Visibility(line1, line2)
-        assert vis.daynight_mode == "subsatellite"
+        assert vis.daynight_mode == "limb"
+        assert Visibility.DAYNIGHT_MODE == "limb"
 
     def test_daynight_mode_subsatellite_stored(self, line1, line2):
         """Custom daynight_mode='subsatellite' is stored."""
@@ -1884,19 +1907,8 @@ class TestEarthlimbDayNight:
             "day/night thresholds for at least some timesteps"
         )
 
-    def test_subsatellite_mode_repr(self, line1, line2):
-        """repr omits daynight when mode is default 'subsatellite'."""
-        vis = Visibility(
-            line1, line2,
-            earthlimb_day_min=25 * u.deg,
-            earthlimb_night_min=10 * u.deg,
-            daynight_mode="subsatellite",
-        )
-        r = repr(vis)
-        assert "daynight=" not in r
-
-    def test_limb_mode_repr_shows_daynight(self, line1, line2):
-        """repr shows daynight=limb when mode is non-default."""
+    def test_limb_mode_repr_omits_daynight(self, line1, line2):
+        """repr omits daynight when mode is the default 'limb'."""
         vis = Visibility(
             line1, line2,
             earthlimb_day_min=25 * u.deg,
@@ -1904,7 +1916,18 @@ class TestEarthlimbDayNight:
             daynight_mode="limb",
         )
         r = repr(vis)
-        assert "daynight=limb" in r
+        assert "daynight=" not in r
+
+    def test_subsatellite_mode_repr_shows_daynight(self, line1, line2):
+        """repr shows daynight=subsatellite when mode is non-default."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=10 * u.deg,
+            daynight_mode="subsatellite",
+        )
+        r = repr(vis)
+        assert "daynight=subsatellite" in r
 
     def test_subsatellite_no_effect_without_day_night(self, line1, line2, target_coord):
         """When day/night both None, daynight_mode makes no difference."""
@@ -2658,16 +2681,28 @@ class TestEarthlimbRegressionSpotChecks:
     def south_target(self):
         return SkyCoord(270.0, -66.0, frame="icrs", unit="deg")
 
+    # Every day/night entry names its mode explicitly, so both are pinned
+    # and neither can drift if DAYNIGHT_MODE changes again.  The "mode
+    # implicit" rows pin what the default currently resolves to.
     @pytest.mark.parametrize("kwargs,expected", [
         ({}, 2259),
         (dict(earthlimb_day_min=40 * u.deg,
-              earthlimb_night_min=5 * u.deg), 2159),
+              earthlimb_night_min=5 * u.deg,
+              daynight_mode="subsatellite"), 2159),
         (dict(earthlimb_day_min=40 * u.deg,
               earthlimb_night_min=5 * u.deg,
               daynight_mode="limb"), 2626),
+        # mode implicit — must track the "limb" row above
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg), 2626),
         (dict(earthlimb_day_min=40 * u.deg,
               earthlimb_night_min=5 * u.deg,
-              twilight_margin=18 * u.deg), 1768),
+              twilight_margin=18 * u.deg,
+              daynight_mode="subsatellite"), 1768),
+        # mode implicit, with twilight margin
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg,
+              twilight_margin=18 * u.deg), 2091),
     ])
     def test_visible_counts_unchanged(self, times, south_target, kwargs, expected):
         """Visible-timestep counts for known configurations."""
