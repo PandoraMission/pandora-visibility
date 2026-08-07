@@ -14,19 +14,41 @@ _R_EARTH_M = R_earth.to(u.m).value
 # nominal Earth angular radius converts it to the limb-referenced angle used
 # everywhere else in this module.
 #
-# The curve is anchored at three points — (78, 110), (89, 82) and (90, 75) —
-# flat outside them and straight lines in between, so it is continuous.
+# The curve is anchored at three points — (78, bright), (89, 82) and (90, 75)
+# — flat outside them and straight lines in between, so it is continuous.
+# Only the bright anchor differs between the boresight and the star trackers;
+# the knee and the dark shelf are shared.
 _DYN_EARTH_ANGULAR_RADIUS_DEG = 66.0
 _DYN_BRIGHT_ILLUM_DEG, _DYN_BRIGHT_KEEPOUT_DEG = 78.0, 110.0
 _DYN_KNEE_ILLUM_DEG, _DYN_KNEE_KEEPOUT_DEG = 89.0, 82.0
 _DYN_DARK_ILLUM_DEG, _DYN_DARK_KEEPOUT_DEG = 90.0, 75.0
 
-# Rule 1 (78 - 89 deg) and rule 2 (89 - 90 deg) linear fits through them
-_DYN_RULE1_M = (
-    (_DYN_KNEE_KEEPOUT_DEG - _DYN_BRIGHT_KEEPOUT_DEG)
-    / (_DYN_KNEE_ILLUM_DEG - _DYN_BRIGHT_ILLUM_DEG)
-)
-_DYN_RULE1_B = _DYN_BRIGHT_KEEPOUT_DEG - _DYN_RULE1_M * _DYN_BRIGHT_ILLUM_DEG
+# Star tracker bright anchor: 96 deg from the Earth centre, i.e. 30 deg above
+# the limb once the nominal Earth angular radius is removed, against the
+# boresight's 110 - 66 = 44 deg.  The trackers tolerate a brighter Earth than
+# the science detector, so their wedge sits lower on the day side but rejoins
+# the boresight curve at the knee and on the dark shelf.
+_DYN_ST_BRIGHT_KEEPOUT_DEG = 96.0
+
+
+def _dyn_rule1_fit(bright_keepout_deg):
+    """Slope and intercept of rule 1 (78 - 89 deg) for one bright anchor.
+
+    Rule 1 is the only segment that depends on the bright anchor, so both
+    the boresight and star tracker wedges come from this one fit rather
+    than two hand-written copies of the same algebra.
+    """
+    slope = (
+        (_DYN_KNEE_KEEPOUT_DEG - bright_keepout_deg)
+        / (_DYN_KNEE_ILLUM_DEG - _DYN_BRIGHT_ILLUM_DEG)
+    )
+    return slope, bright_keepout_deg - slope * _DYN_BRIGHT_ILLUM_DEG
+
+
+# Rule 1 (78 - 89 deg) and rule 2 (89 - 90 deg) linear fits through the anchors
+_DYN_RULE1_M, _DYN_RULE1_B = _dyn_rule1_fit(_DYN_BRIGHT_KEEPOUT_DEG)
+_DYN_ST_RULE1_M, _DYN_ST_RULE1_B = _dyn_rule1_fit(_DYN_ST_BRIGHT_KEEPOUT_DEG)
+# Rule 2 runs between the shared knee and dark anchors, so it is common to both.
 _DYN_RULE2_M = (
     (_DYN_DARK_KEEPOUT_DEG - _DYN_KNEE_KEEPOUT_DEG)
     / (_DYN_DARK_ILLUM_DEG - _DYN_KNEE_ILLUM_DEG)
@@ -123,6 +145,11 @@ class Visibility:
     ST_SUN_MIN = 0 * u.deg
     ST_MOON_MIN = 0 * u.deg
     ST_EARTHLIMB_MIN = 0 * u.deg
+    # True = star tracker Earth limb keep-out follows the ST DPC wedge
+    # (30 deg above the limb over a bright Earth, easing to 9 deg over a
+    # dark one) instead of the flat ST_EARTHLIMB_MIN.  Independent of
+    # USE_DYNAMIC_EARTHLIMB, which does the same for the boresight.
+    USE_DYNAMIC_EARTHLIMB_ST = False
     ST1_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
     ST2_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
     ST_REQUIRED = 1  # Number of star trackers required to pass (0, 1, or 2)
@@ -217,6 +244,9 @@ class Visibility:
         self.st2_earthlimb_min = custom_limits.get(
             "st2_earthlimb_min", self.ST2_EARTHLIMB_MIN
         )
+        self.use_dynamic_earthlimb_st = custom_limits.get(
+            "use_dynamic_earthlimb_st", self.USE_DYNAMIC_EARTHLIMB_ST
+        )
         self.st_required = custom_limits.get("st_required", self.ST_REQUIRED)
         if self.st_required not in (0, 1, 2):
             raise ValueError(f"st_required must be 0, 1, or 2, got {self.st_required}")
@@ -277,7 +307,11 @@ class Visibility:
             constraints.append(f"st_sun≥{self.st_sun_min:.0f}")
         if self.st_moon_min > 0 * u.deg:
             constraints.append(f"st_moon≥{self.st_moon_min:.0f}")
-        if self.st_earthlimb_min > 0 * u.deg:
+        if self.use_dynamic_earthlimb_st:
+            # The ST wedge replaces every static ST limb limit, so report it
+            # alone rather than alongside limits that are no longer applied.
+            constraints.append("st_limb=dynamic")
+        elif self.st_earthlimb_min > 0 * u.deg:
             if self.st1_earthlimb_min is not None or self.st2_earthlimb_min is not None:
                 st1_lim = self._st_earthlimb_min_for(1)
                 st2_lim = self._st_earthlimb_min_for(2)
@@ -558,58 +592,111 @@ class Visibility:
 
     @staticmethod
     def _get_earth_illumination_angle(target_unit, zenith_unit, sun_unit,
-                                      limb_angle_rad=None):
+                                      limb_angle_rad=None, axis=0):
         """Earth illumination angle at the nearest limb point, in degrees.
 
         This is the solar zenith angle at the Earth surface point the
-        boresight grazes: the angle between that point's outward surface
-        normal and the direction to the Sun.  0 deg is the subsolar point
-        (brightest limb), 90 deg is the terminator, 180 deg is the
+        pointing direction grazes: the angle between that point's outward
+        surface normal and the direction to the Sun.  0 deg is the subsolar
+        point (brightest limb), 90 deg is the terminator, 180 deg is the
         antisolar point (fully dark limb).
 
         The surface normal is built exactly as in ``_earthlimb_is_sunlit``,
 
             n = cos(limb_angle) * zenith  +  sin(limb_angle) * limb_dir
 
+        `target_unit` is the science boresight for the payload keep-out and
+        a star tracker boresight for the tracker keep-out; the geometry is
+        the same either way.
+
         Parameters
         ----------
-        target_unit : ndarray, shape (3,) or (3, N)
-            Target direction unit vector(s) in GCRS.
-        zenith_unit : ndarray, shape (3,) or (3, N)
-            Observer zenith direction unit vector(s).
-        sun_unit : ndarray, shape (3,) or (3, N)
-            Sun direction unit vector(s).
+        target_unit : ndarray
+            Pointing direction unit vector(s) in GCRS, with the 3-vector
+            components along *axis*.  Shapes (3,), (3, N), (3, 1) and the
+            (N_roll, 3, N_samp) layout of the roll sweep all work.
+        zenith_unit : ndarray
+            Observer zenith direction unit vector(s), broadcastable against
+            *target_unit*.
+        sun_unit : ndarray
+            Sun direction unit vector(s), broadcastable against *target_unit*.
         limb_angle_rad : float or ndarray or None
             Earth-limb half-angle in radians (``arccos(R_earth / d)``).
             When *None*, falls back to a simple horizontal projection
             (ignoring the zenith component of the surface normal).
+        axis : int
+            Axis holding the 3 cartesian components.  0 for the usual
+            ``(3, ...)`` arrays, 1 for the roll sweep's ``(N_roll, 3,
+            N_samp)``.
 
         Returns
         -------
         float or ndarray
-            Illumination angle in degrees, in [0, 180].
+            Illumination angle in degrees, in [0, 180], with *axis* removed.
         """
-        dot_tz = np.sum(target_unit * zenith_unit, axis=0)
-        if target_unit.ndim == 1:
-            proj = target_unit - zenith_unit * dot_tz
-        else:
-            proj = target_unit - zenith_unit * dot_tz[np.newaxis, :]
-        proj_norm = np.linalg.norm(proj, axis=0, keepdims=True)
+        dot_tz = np.sum(target_unit * zenith_unit, axis=axis)
+        proj = target_unit - zenith_unit * np.expand_dims(dot_tz, axis)
+        proj_norm = np.linalg.norm(proj, axis=axis, keepdims=True)
         limb_unit = proj / np.where(proj_norm < 1e-12, 1.0, proj_norm)
 
         if limb_angle_rad is None:
             # Legacy fallback: horizontal projection only
-            dot_n_sun = np.sum(limb_unit * sun_unit, axis=0)
+            dot_n_sun = np.sum(limb_unit * sun_unit, axis=axis)
         else:
             dot_n_sun = (
-                np.cos(limb_angle_rad) * np.sum(zenith_unit * sun_unit, axis=0)
-                + np.sin(limb_angle_rad) * np.sum(limb_unit * sun_unit, axis=0)
+                np.cos(limb_angle_rad) * np.sum(zenith_unit * sun_unit, axis=axis)
+                + np.sin(limb_angle_rad) * np.sum(limb_unit * sun_unit, axis=axis)
             )
         return np.rad2deg(np.arccos(np.clip(dot_n_sun, -1.0, 1.0)))
 
     @staticmethod
+    def _dynamic_wedge_deg(illumination_deg, bright_keepout_deg,
+                           rule1_m, rule1_b):
+        """Evaluate one DPC wedge, in degrees above the limb.
+
+        Shared by the boresight and star tracker wedges, which differ only
+        in their bright anchor and the rule 1 fit that follows from it.
+
+        Parameters
+        ----------
+        illumination_deg : float or ndarray
+            Earth illumination angle(s) in degrees.  Any angle is
+            accepted; it is folded into [0, 180] before evaluation.
+        bright_keepout_deg : float
+            Keep-out from the Earth centre on the bright shelf
+            (illumination <= 78 deg).
+        rule1_m, rule1_b : float
+            Slope and intercept of the 78 - 89 deg segment, from
+            ``_dyn_rule1_fit(bright_keepout_deg)``.
+
+        Returns
+        -------
+        float or ndarray
+            Minimum allowed angle above the Earth limb, in degrees.
+        """
+        # Fold onto [0, 180]: the keep-out depends only on how far the
+        # limb point is from the sub-solar direction, not on which side.
+        illum = np.abs(
+            (np.asarray(illumination_deg, dtype=float) + 180.0) % 360.0 - 180.0
+        )
+        keepout = np.where(
+            illum < _DYN_BRIGHT_ILLUM_DEG,
+            bright_keepout_deg,
+            np.where(
+                illum <= _DYN_KNEE_ILLUM_DEG,
+                rule1_m * illum + rule1_b,
+                np.where(
+                    illum < _DYN_DARK_ILLUM_DEG,
+                    _DYN_RULE2_M * illum + _DYN_RULE2_B,
+                    _DYN_DARK_KEEPOUT_DEG,
+                ),
+            ),
+        )
+        return keepout - _DYN_EARTH_ANGULAR_RADIUS_DEG
+
+    @staticmethod
     def _dynamic_earthlimb_min_deg(illumination_deg):
-        """DPC wedge keep-out in degrees above the limb.
+        """Boresight DPC wedge keep-out in degrees above the limb.
 
         Piecewise function of the Earth illumination angle (see
         ``_get_earth_illumination_angle``), given from the Earth centre as
@@ -628,7 +715,8 @@ class Visibility:
 
         The nominal Earth angular radius (66 deg) is subtracted so the
         result is referenced to the limb like every other Earth limb
-        angle in this class.
+        angle in this class, giving 44 deg on the bright shelf down to
+        9 deg on the dark one.
 
         The input is wrapped into [0, 180] first, so the curve is
         symmetric about the sub-solar and anti-solar directions: -78,
@@ -645,25 +733,48 @@ class Visibility:
         float or ndarray
             Minimum allowed angle above the Earth limb, in degrees.
         """
-        # Fold onto [0, 180]: the keep-out depends only on how far the
-        # limb point is from the sub-solar direction, not on which side.
-        illum = np.abs(
-            (np.asarray(illumination_deg, dtype=float) + 180.0) % 360.0 - 180.0
+        return Visibility._dynamic_wedge_deg(
+            illumination_deg, _DYN_BRIGHT_KEEPOUT_DEG,
+            _DYN_RULE1_M, _DYN_RULE1_B,
         )
-        keepout = np.where(
-            illum < _DYN_BRIGHT_ILLUM_DEG,
-            _DYN_BRIGHT_KEEPOUT_DEG,
-            np.where(
-                illum <= _DYN_KNEE_ILLUM_DEG,
-                _DYN_RULE1_M * illum + _DYN_RULE1_B,
-                np.where(
-                    illum < _DYN_DARK_ILLUM_DEG,
-                    _DYN_RULE2_M * illum + _DYN_RULE2_B,
-                    _DYN_DARK_KEEPOUT_DEG,
-                ),
-            ),
+
+    @staticmethod
+    def _dynamic_st_earthlimb_min_deg(illumination_deg):
+        """Star tracker DPC wedge keep-out in degrees above the limb.
+
+        The same shape as the boresight wedge, but anchored at 96 deg from
+        the Earth centre on the bright shelf instead of 110 deg, because
+        the trackers tolerate a brighter Earth than the science detector:
+
+        ===================  ===========================
+        Illumination angle   Keep-out from Earth centre
+        ===================  ===========================
+        <= 78 deg            96 deg
+        78 - 89 deg          linear rule 1 (96 → 82 deg)
+        89 - 90 deg          linear rule 2 (82 → 75 deg)
+        >= 90 deg            75 deg
+        ===================  ===========================
+
+        Only rule 1 differs; the knee and the dark shelf are shared with
+        the boresight curve.  Referenced to the limb that is 30 deg on the
+        bright shelf, matching the flat ``st_earthlimb_min`` this replaces,
+        easing to 9 deg over a fully dark limb.
+
+        Parameters
+        ----------
+        illumination_deg : float or ndarray
+            Earth illumination angle(s) in degrees.  Any angle is
+            accepted; it is folded into [0, 180] before evaluation.
+
+        Returns
+        -------
+        float or ndarray
+            Minimum allowed angle above the Earth limb, in degrees.
+        """
+        return Visibility._dynamic_wedge_deg(
+            illumination_deg, _DYN_ST_BRIGHT_KEEPOUT_DEG,
+            _DYN_ST_RULE1_M, _DYN_ST_RULE1_B,
         )
-        return keepout - _DYN_EARTH_ANGULAR_RADIUS_DEG
 
     @staticmethod
     def _subsatellite_is_sunlit(zenith_unit, sun_unit,
@@ -1009,6 +1120,10 @@ class Visibility:
             2: {...}}``, each value a float or (N,) array of degrees.  NaN
             wherever the attitude is degenerate, which compares False
             against any threshold.
+        thresholds : dict
+            Same keys, holding the limit each separation is judged against
+            in degrees.  Scalar for the fixed keep-outs; per-timestep for
+            ``earthlimb_angle`` under ``use_dynamic_earthlimb_st``.
         degenerate : bool or np.ndarray of bool
             True where the attitude is undefined (target aligned with the
             Sun, so ``Sun x Z`` does not define a payload +Y).
@@ -1052,7 +1167,7 @@ class Visibility:
             x_norms = np.linalg.norm(x_payload, axis=0, keepdims=True)
             x_payload = x_payload / np.where(x_norms < 1e-10, 1.0, x_norms)
 
-        separations = {}
+        separations, thresholds = {}, {}
         for tracker in [1, 2]:
             st_body = np.array(self._get_star_tracker_body_xyz(tracker))
 
@@ -1081,8 +1196,19 @@ class Visibility:
                         st_eci, zenith_unit, limb_rad
                     ),
                 }
+                # The limb threshold rides on this tracker's own boresight
+                # when the dynamic wedge is on, so it belongs here beside
+                # the separation it will be compared against.
+                thresholds[tracker] = {
+                    "sun_angle": self.st_sun_min.to(u.deg).value,
+                    "moon_angle": self.st_moon_min.to(u.deg).value,
+                    "earthlimb_angle": self._effective_st_earthlimb_min_deg(
+                        tracker, st_eci, zenith_unit, body_units["sun"],
+                        limb_angle_rad=limb_rad,
+                    ),
+                }
 
-        return separations, degenerate
+        return separations, thresholds, degenerate
 
     def _get_st_constraint_fast(self, tgt_unit, time, pre, *,
                                 effective_roll=None):
@@ -1103,7 +1229,7 @@ class Visibility:
         effective_roll : Quantity or None
             Roll angle to use.  If ``None``, falls back to ``self.roll``.
         """
-        separations, degenerate = self._st_tracker_separations(
+        separations, thresholds, degenerate = self._st_tracker_separations(
             tgt_unit, time, pre, effective_roll=effective_roll,
         )
 
@@ -1117,11 +1243,11 @@ class Visibility:
             else:
                 tracker_ok = np.ones(time.shape, dtype=bool)
 
-            for _, limit, key in self._st_checks_for(tracker):
+            for _, _, key in self._st_checks_for(tracker):
                 sep = separations[tracker].get(key)
                 if sep is None:
                     continue
-                tracker_ok = tracker_ok & (sep >= limit.to(u.deg).value)
+                tracker_ok = tracker_ok & (sep >= thresholds[tracker][key])
 
             tracker_results.append(tracker_ok)
 
@@ -1520,11 +1646,11 @@ class Visibility:
                 )
                 st1_ok_orb = self._sweep_tracker(
                     x_pay_all, y_pay_all, z_col_orb, st1_body, st1_checks,
-                    bu_orb, zen_orb, limb_orb,
+                    bu_orb, zen_orb, limb_orb, tracker=1,
                 )
                 st2_ok_orb = self._sweep_tracker(
                     x_pay_all, y_pay_all, z_col_orb, st2_body, st2_checks,
-                    bu_orb, zen_orb, limb_orb,
+                    bu_orb, zen_orb, limb_orb, tracker=2,
                 )
 
                 # Solar power
@@ -1630,6 +1756,10 @@ class Visibility:
                     sep = self._fast_sep_deg(st1_eci, bu_inp["moon"])
                 elif key == "earthlimb_angle":
                     sep = self._fast_limb_deg(st1_eci, zen_inp, limb_inp)
+                    lim = self._effective_st_earthlimb_min_deg(
+                        1, st1_eci, zen_inp, bu_inp["sun"],
+                        limb_angle_rad=limb_inp,
+                    )
                 else:
                     continue
                 t1_ok &= sep >= lim
@@ -1643,6 +1773,10 @@ class Visibility:
                     sep = self._fast_sep_deg(st2_eci, bu_inp["moon"])
                 elif key == "earthlimb_angle":
                     sep = self._fast_limb_deg(st2_eci, zen_inp, limb_inp)
+                    lim = self._effective_st_earthlimb_min_deg(
+                        2, st2_eci, zen_inp, bu_inp["sun"],
+                        limb_angle_rad=limb_inp,
+                    )
                 else:
                     continue
                 t2_ok &= sep >= lim
@@ -1723,11 +1857,58 @@ class Visibility:
             return False
         if self.st_sun_min > 0 * u.deg or self.st_moon_min > 0 * u.deg:
             return True
+        # The dynamic ST wedge replaces st_earthlimb_min outright, so it is
+        # active on its own even with every static limit left at zero.
+        if self.use_dynamic_earthlimb_st:
+            return True
         # Check if any tracker has an active Earth limb constraint
         for t in [1, 2]:
             if self._st_earthlimb_min_for(t) > 0 * u.deg:
                 return True
         return False
+
+    def _effective_st_earthlimb_min_deg(self, tracker, st_unit, zenith_unit,
+                                        sun_unit, limb_angle_rad=None, axis=0):
+        """Per-timestep star tracker Earth limb threshold, in degrees.
+
+        With ``use_dynamic_earthlimb_st`` the threshold follows the ST DPC
+        wedge, evaluated from the illumination angle at the limb point that
+        *this tracker* grazes — so each tracker gets its own threshold, and
+        a tracker looking at a dark limb is held to 9 deg while one looking
+        at a bright limb is held to 30 deg.  Otherwise it is the flat
+        per-tracker ``st_earthlimb_min``.
+
+        The single source of the ST limb threshold: the constraint check,
+        the roll sweep, the breakdown and ``summary`` all call this, so none
+        of them can apply a threshold the others do not.
+
+        Parameters
+        ----------
+        tracker : int
+            Star tracker number (1 or 2).
+        st_unit : ndarray
+            Tracker boresight unit vector(s) in GCRS, 3-vector along *axis*.
+        zenith_unit, sun_unit : ndarray
+            Observer zenith and Sun directions, broadcastable against
+            *st_unit*.
+        limb_angle_rad : float or ndarray or None
+            Earth-limb half-angle in radians.
+        axis : int
+            Axis holding the 3 cartesian components of *st_unit*.
+
+        Returns
+        -------
+        float or ndarray
+            Minimum allowed angle above the Earth limb, in degrees.
+        """
+        if not self.use_dynamic_earthlimb_st:
+            return self._st_earthlimb_min_for(tracker).to(u.deg).value
+        return self._dynamic_st_earthlimb_min_deg(
+            self._get_earth_illumination_angle(
+                st_unit, zenith_unit, sun_unit,
+                limb_angle_rad=limb_angle_rad, axis=axis,
+            )
+        )
 
     def _st_earthlimb_min_for(self, tracker: int):
         """Effective Earth limb keep-out for a specific tracker.
@@ -1751,6 +1932,10 @@ class Visibility:
         Returns
         -------
         list of (name, limit, key) tuples
+            The ``limit`` of the ``"earthlimb_angle"`` check is only
+            meaningful when ``use_dynamic_earthlimb_st`` is False; with the
+            dynamic wedge on it varies per timestep, so callers must take
+            the threshold from ``_effective_st_earthlimb_min_deg`` instead.
         """
         checks = []
         if self.st_sun_min > 0 * u.deg:
@@ -1758,7 +1943,9 @@ class Visibility:
         if self.st_moon_min > 0 * u.deg:
             checks.append(("moon", self.st_moon_min, "moon_angle"))
         limb_min = self._st_earthlimb_min_for(tracker)
-        if limb_min > 0 * u.deg:
+        # The dynamic wedge overrides st_earthlimb_min, so the limb check
+        # runs even when the static limit is zero.
+        if limb_min > 0 * u.deg or self.use_dynamic_earthlimb_st:
             checks.append(("limb", limb_min, "earthlimb_angle"))
         return checks
 
@@ -1860,7 +2047,7 @@ class Visibility:
         return (cos_r * x_ref + sin_r * y_ref, -sin_r * x_ref + cos_r * y_ref)
 
     def _sweep_tracker(self, x_payload, y_payload, z_col, st_body, checks,
-                       body_units, zenith_unit, limb_rad):
+                       body_units, zenith_unit, limb_rad, tracker=1):
         """Star tracker keep-out check for every roll angle at once.
 
         Parameters
@@ -1875,6 +2062,8 @@ class Visibility:
             Active checks from ``_st_checks_for``.
         body_units, zenith_unit, limb_rad
             Precomputed time-dependent quantities for the same samples.
+        tracker : int
+            Star tracker number, used to pick the Earth limb threshold.
 
         Returns
         -------
@@ -1902,6 +2091,13 @@ class Visibility:
                 dot = np.sum(st_eci * zenith_unit[np.newaxis], axis=1)
                 sep = np.rad2deg(
                     np.arcsin(np.clip(dot, -1.0, 1.0)) + limb_rad
+                )
+                # Each roll angle points the tracker at a different limb
+                # point, so the dynamic threshold is (N_roll, N_samp) too.
+                limit_deg = self._effective_st_earthlimb_min_deg(
+                    tracker, st_eci, zenith_unit[np.newaxis],
+                    body_units["sun"][np.newaxis],
+                    limb_angle_rad=limb_rad, axis=1,
                 )
             else:
                 continue
@@ -2236,7 +2432,7 @@ class Visibility:
         if not time.isscalar:
             target_unit = target_unit[:, 0].copy()
 
-        separations, degenerate = self._st_tracker_separations(
+        separations, thresholds, degenerate = self._st_tracker_separations(
             target_unit, time, pre, effective_roll=effective_roll,
         )
 
@@ -2250,13 +2446,20 @@ class Visibility:
             else:
                 tracker_ok = np.ones(time.shape, dtype=bool)
 
-            for name, limit, key in self._st_checks_for(tracker):
+            for name, _, key in self._st_checks_for(tracker):
                 sep = separations[tracker][key]
-                ok = sep >= limit.to(u.deg).value
+                threshold = thresholds[tracker][key]
+                ok = sep >= threshold
                 row = f"ST{tracker} {name}"
                 passed[row] = bool(ok) if time.isscalar else np.asarray(ok)
                 seps_out[row] = sep
-                limits_out[row] = limit
+                # Report the threshold actually applied.  Under the dynamic
+                # ST wedge this is per-timestep for the limb check, so an
+                # array time gives an array limit; a scalar time always
+                # gives a plain scalar.
+                limits_out[row] = (
+                    float(threshold) if time.isscalar else np.asarray(threshold)
+                ) * u.deg
                 tracker_ok = tracker_ok & ok
 
             tracker_overall[tracker] = (
@@ -2448,26 +2651,28 @@ class Visibility:
                 f"Star Tracker Constraints (need {req_label} tracker passing):"
             )
 
+            # Read the angles and the thresholds off the breakdown rather
+            # than get_star_tracker_angles, so the reported requirement is
+            # the one the constraint applied, including the per-timestep
+            # threshold under use_dynamic_earthlimb_st.
+            breakdown = self.get_star_tracker_breakdown(target_coord, time)
             for tracker in [1, 2]:
-                try:
-                    angles = self.get_star_tracker_angles(target_coord, time, tracker)
-                    tracker_pass = True
-                    details = []
-                    for name, limit, key in self._st_checks_for(tracker):
-                        actual = angles[key]
-                        ok = bool(actual >= limit)
-                        tracker_pass = tracker_pass and ok
-                        sym = "✓" if ok else "✗"
-                        details.append(
-                            f"{name}:{sym} req:{limit:>6.1f} act:{actual:>6.1f}"
-                        )
-                    symbol = "✓" if tracker_pass else "✗"
-                    status = "PASS" if tracker_pass else "FAIL"
-                    lines.append(f"  ST{tracker:<8}{symbol} {status}")
-                    for d in details:
-                        lines.append(f"    {d}")
-                except ValueError as e:
-                    lines.append(f"  ST{tracker:<8}✗ ERROR ({e})")
+                details = []
+                for name, _, _ in self._st_checks_for(tracker):
+                    row = f"ST{tracker} {name}"
+                    ok = bool(breakdown["passed"][row])
+                    actual = float(breakdown["separations"][row]) * u.deg
+                    limit = breakdown["limits"][row]
+                    sym = "✓" if ok else "✗"
+                    details.append(
+                        f"{name}:{sym} req:{limit:>6.1f} act:{actual:>6.1f}"
+                    )
+                tracker_pass = bool(breakdown["passed"][f"ST{tracker}"])
+                symbol = "✓" if tracker_pass else "✗"
+                status = "PASS" if tracker_pass else "FAIL"
+                lines.append(f"  ST{tracker:<8}{symbol} {status}")
+                for d in details:
+                    lines.append(f"    {d}")
 
             st_combined = self.get_star_tracker_constraint(target_coord, time)
             st_sym = "✓" if st_combined else "✗"

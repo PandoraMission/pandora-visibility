@@ -531,6 +531,168 @@ class TestStarTrackerConstraints:
     def test_time(self):
         return Time("2025-01-01T00:00:00")
 
+    def test_dynamic_st_defaults_off(self, line1, line2):
+        """use_dynamic_earthlimb_st defaults to False."""
+        vis = Visibility(line1, line2)
+        assert vis.use_dynamic_earthlimb_st is False
+        assert Visibility.USE_DYNAMIC_EARTHLIMB_ST is False
+
+    @pytest.mark.parametrize("illum,expected", [
+        (0.0, 30.0),      # bright shelf: 96 - 66
+        (50.0, 30.0),
+        (78.0, 30.0),     # bright anchor
+        (83.5, 23.0),     # midpoint of rule 1
+        (89.0, 16.0),     # knee, shared with the boresight wedge
+        (89.5, 12.5),     # midpoint of rule 2
+        (90.0, 9.0),      # dark anchor
+        (180.0, 9.0),     # dark shelf
+    ])
+    def test_dynamic_st_wedge_anchors(self, illum, expected):
+        """ST wedge is 30 deg over a bright limb, easing to 9 deg over a dark one."""
+        got = float(Visibility._dynamic_st_earthlimb_min_deg(illum))
+        assert got == pytest.approx(expected)
+
+    def test_dynamic_st_wedge_never_exceeds_boresight(self):
+        """The ST wedge is never tighter than the boresight wedge."""
+        illum = np.linspace(0.0, 180.0, 1801)
+        st = np.asarray(Visibility._dynamic_st_earthlimb_min_deg(illum))
+        bs = np.asarray(Visibility._dynamic_earthlimb_min_deg(illum))
+        assert np.all(st <= bs + 1e-9)
+        # and they coincide from the knee onwards
+        assert np.allclose(st[illum >= 89.0], bs[illum >= 89.0])
+
+    def test_dynamic_st_wedge_continuous(self):
+        """No jump at the 78 / 89 / 90 deg knots."""
+        for knot in (78.0, 89.0, 90.0):
+            lo = float(Visibility._dynamic_st_earthlimb_min_deg(knot - 1e-6))
+            hi = float(Visibility._dynamic_st_earthlimb_min_deg(knot + 1e-6))
+            assert abs(hi - lo) < 1e-4
+
+    def test_dynamic_st_wedge_folds_like_boresight(self):
+        """Angles outside [0, 180] fold onto the same keep-out."""
+        for illum in (0.0, 45.0, 83.5, 89.5, 120.0):
+            base = float(Visibility._dynamic_st_earthlimb_min_deg(illum))
+            for equivalent in (-illum, illum + 360.0, 360.0 - illum):
+                assert float(
+                    Visibility._dynamic_st_earthlimb_min_deg(equivalent)
+                ) == pytest.approx(base)
+
+    def test_dynamic_st_activates_without_static_limit(self, line1, line2):
+        """The wedge replaces st_earthlimb_min, so it works with it left at 0."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb_st=True)
+        assert vis.st_earthlimb_min == 0 * u.deg
+        assert vis._st_constraint_active is True
+        assert [c[0] for c in vis._st_checks_for(1)] == ["limb"]
+        assert [c[0] for c in vis._st_checks_for(2)] == ["limb"]
+
+    def test_dynamic_st_repr(self, line1, line2):
+        """repr shows st_limb=dynamic instead of the static limits."""
+        vis = Visibility(line1, line2, st_earthlimb_min=30 * u.deg,
+                         use_dynamic_earthlimb_st=True)
+        r = repr(vis)
+        assert "st_limb=dynamic" in r
+        assert "st_limb≥" not in r
+
+    def test_dynamic_st_axis_broadcasting_matches(self, line1, line2, test_time):
+        """The roll sweep's (N_roll, 3, N) layout gives the same thresholds.
+
+        _sweep_tracker evaluates the wedge with the 3-vector on axis 1;
+        every other path uses axis 0.  They must agree exactly.
+        """
+        vis = Visibility(line1, line2, use_dynamic_earthlimb_st=True)
+        times = test_time + np.arange(120) * u.min
+        pre = vis._precompute(times)
+        rng = np.random.default_rng(7)
+        vecs = rng.normal(size=(3, len(times)))
+        vecs /= np.linalg.norm(vecs, axis=0, keepdims=True)
+        axis0 = vis._effective_st_earthlimb_min_deg(
+            1, vecs, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"], axis=0)
+        axis1 = vis._effective_st_earthlimb_min_deg(
+            1, vecs[np.newaxis], pre["zenith_unit"][np.newaxis],
+            pre["body_units"]["sun"][np.newaxis],
+            limb_angle_rad=pre["limb_angle_rad"], axis=1)
+        np.testing.assert_allclose(axis0, axis1[0])
+
+    def test_dynamic_st_only_relaxes(self, line1, line2, target_coord, test_time):
+        """Against a flat 30 deg the wedge can only add visible steps.
+
+        The wedge peaks at exactly 30 deg on the bright shelf and falls
+        below it everywhere else, so no step can be lost.
+        """
+        times = test_time + np.arange(400) * u.min
+        common = dict(st_sun_min=50 * u.deg, st_moon_min=20 * u.deg,
+                      st_required=1)
+        flat = Visibility(line1, line2, **common, st_earthlimb_min=30 * u.deg)
+        wedge = Visibility(line1, line2, **common, use_dynamic_earthlimb_st=True)
+        a = np.asarray(flat.get_visibility(target_coord, times))
+        b = np.asarray(wedge.get_visibility(target_coord, times))
+        assert int((a & ~b).sum()) == 0, "the wedge lost a step it should not"
+
+    def test_dynamic_st_threshold_varies_per_tracker(self, line1, line2,
+                                                     target_coord, test_time):
+        """Each tracker gets the threshold for the limb *it* grazes."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb_st=True)
+        times = test_time + np.arange(300) * u.min
+        breakdown = vis.get_star_tracker_breakdown(target_coord, times)
+        st1 = np.asarray(breakdown["limits"]["ST1 limb"].to(u.deg).value)
+        st2 = np.asarray(breakdown["limits"]["ST2 limb"].to(u.deg).value)
+        assert st1.shape == times.shape       # per-timestep, not scalar
+        assert not np.allclose(st1, st2)      # the trackers differ
+        for arr in (st1, st2):
+            assert arr.min() >= 9.0 - 1e-9
+            assert arr.max() <= 30.0 + 1e-9
+
+    def test_dynamic_st_best_roll_agrees_with_breakdown(self, line1, line2,
+                                                        target_coord, test_time):
+        """get_visibility_best_roll's ST check matches the breakdown's.
+
+        Guards the separate threshold application inside best_roll against
+        drifting from _st_tracker_separations.
+        """
+        vis = Visibility(line1, line2, st_sun_min=50 * u.deg,
+                         st_moon_min=20 * u.deg, st_required=1,
+                         use_dynamic_earthlimb_st=True)
+        times = test_time + np.arange(300) * u.min
+        result = vis.get_visibility_best_roll(target_coord, times)
+        rolls = result["roll_deg"]
+        finite = np.unique(rolls[np.isfinite(rolls)])
+        assert finite.size > 0, "no roll selected; test would be vacuous"
+        for roll in finite:
+            sel = (rolls == roll) & result["visible"]
+            if not sel.any():
+                continue
+            breakdown = vis.get_star_tracker_breakdown(
+                target_coord, times, roll=roll * u.deg)
+            combined = np.asarray(breakdown["passed"]["combined"])
+            assert np.all(combined[sel])
+            n_pass = (np.asarray(breakdown["passed"]["ST1"]).astype(int)
+                      + np.asarray(breakdown["passed"]["ST2"]).astype(int))
+            np.testing.assert_array_equal(n_pass[sel], result["n_st_pass"][sel])
+
+    def test_dynamic_st_summary_reports_applied_threshold(self, line1, line2,
+                                                          target_coord, test_time):
+        """summary() prints the wedge threshold, not the static limit."""
+        vis = Visibility(line1, line2, st_earthlimb_min=30 * u.deg,
+                         st_required=1, use_dynamic_earthlimb_st=True)
+        breakdown = vis.get_star_tracker_breakdown(target_coord, test_time)
+        text = vis.summary(target_coord, test_time)
+        applied = float(breakdown["limits"]["ST1 limb"].to(u.deg).value)
+        assert f"req:{applied:>6.1f} deg" in text, text
+        # the static limit must not be what gets shown, unless it coincides
+        if abs(applied - 30.0) > 0.05:
+            assert "req:  30.0 deg" not in text
+
+    def test_dynamic_st_independent_of_boresight_flag(self, line1, line2):
+        """The two dynamic flags are independent switches."""
+        st_only = Visibility(line1, line2, st_sun_min=50 * u.deg,
+                             st_required=1, use_dynamic_earthlimb_st=True)
+        assert st_only.use_dynamic_earthlimb is False
+        assert st_only.use_dynamic_earthlimb_st is True
+        boresight_only = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        assert boresight_only.use_dynamic_earthlimb is True
+        assert boresight_only.use_dynamic_earthlimb_st is False
+
     @pytest.fixture
     def breakdown_vis(self, line1, line2):
         return Visibility(
