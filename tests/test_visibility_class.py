@@ -531,6 +531,105 @@ class TestStarTrackerConstraints:
     def test_time(self):
         return Time("2025-01-01T00:00:00")
 
+    def test_best_roll_tiebreak_stays_window_optimal(self, line1, line2):
+        """Breaking ties on input coverage never gives up orbit coverage.
+
+        The tie-break only reorders rolls that already tie at the orbit
+        window maximum, so the chosen roll must still hit that maximum.
+        """
+        vis = Visibility(line1, line2, st_sun_min=44 * u.deg,
+                         st_moon_min=12 * u.deg, st_earthlimb_min=30 * u.deg,
+                         st_required=1)
+        target = SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
+        times = Time("2026-02-15T18:00:00") + np.arange(300) * u.min
+        roll_step, orbit_step = 10 * u.deg, 2 * u.min
+
+        result = vis.get_visibility_best_roll(
+            target, times, roll_step=roll_step, orbit_time_step=orbit_step)
+
+        rolls = np.arange(0, 360, roll_step.to(u.deg).value)
+        grid = vis._orbit_sampling_grid(times, orbit_step)
+        period_min = vis.get_period().to(u.min).value
+        period_day = vis.get_period().to(u.day).value
+        offsets = np.linspace(
+            -period_min / 2, period_min / 2, grid["n_orbit_samp"]) * u.min
+        orbit_id = np.floor(
+            (times.jd - times.jd.min()) / period_day).astype(int)
+
+        checked = 0
+        for position, oid in enumerate(grid["orbit_ids"]):
+            idx = np.where(orbit_id == oid)[0]
+            picked = result["roll_deg"][idx]
+            picked = picked[np.isfinite(picked)]
+            if picked.size == 0:
+                continue
+            window = grid["centers"][position] + offsets
+            counts = np.array([
+                int(np.asarray(
+                    vis.get_visibility(target, window, roll=r * u.deg)).sum())
+                for r in rolls
+            ])
+            nearest = int(np.argmin(
+                np.abs(((rolls - picked[0]) + 180) % 360 - 180)))
+            assert counts[nearest] == counts.max(), (
+                f"orbit {oid}: chosen roll covers {counts[nearest]} window "
+                f"samples, best available is {counts.max()}"
+            )
+            checked += 1
+        assert checked > 0, "no orbit selected a roll; test would be vacuous"
+
+    def test_best_roll_reports_what_that_roll_gives(self, line1, line2):
+        """The reported visibility matches evaluating the chosen roll directly.
+
+        Guards the tie-break's extra _sweep_tracker pass against disagreeing
+        with the per-orbit evaluation that follows it.
+        """
+        vis = Visibility(line1, line2, st_sun_min=44 * u.deg,
+                         st_moon_min=12 * u.deg, st_earthlimb_min=30 * u.deg,
+                         st_required=1)
+        target = SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
+        times = Time("2026-02-15T18:00:00") + np.arange(600) * u.min
+        result = vis.get_visibility_best_roll(target, times)
+
+        visible = np.asarray(result["visible"])
+        rolls = result["roll_deg"]
+        period_day = vis.get_period().to(u.day).value
+        orbit_id = np.floor(
+            (times.jd - times.jd.min()) / period_day).astype(int)
+
+        checked = 0
+        for oid in np.unique(orbit_id):
+            idx = np.where(orbit_id == oid)[0]
+            picked = rolls[idx]
+            picked = picked[np.isfinite(picked)]
+            if picked.size == 0:
+                continue
+            direct = np.asarray(
+                vis.get_visibility(target, times[idx], roll=picked[0] * u.deg))
+            assert int(visible[idx].sum()) == int(direct.sum()), (
+                f"orbit {oid}: best_roll reports {int(visible[idx].sum())} "
+                f"visible but the same roll gives {int(direct.sum())}"
+            )
+            checked += 1
+        assert checked > 0
+
+    def test_best_roll_tiebreak_recovers_steps(self, line1, line2):
+        """The tie-break wins back steps the power-only choice gave away.
+
+        Pinned so that reverting to the solar-power-only tie-break fails
+        here: this configuration returned 61 visible steps when ties were
+        settled on solar power alone, and 66 once the requested timesteps
+        settle them first.
+        """
+        vis = Visibility(line1, line2, st_sun_min=50 * u.deg,
+                         st_moon_min=20 * u.deg, st_required=1,
+                         use_dynamic_earthlimb_st=True)
+        target = SkyCoord(79.17305002, 45.99514569, frame="icrs", unit="deg")
+        times = Time("2026-02-15T18:00:00") + np.arange(0, 1440, 10) * u.min
+        result = vis.get_visibility_best_roll(target, times)
+        assert int(np.asarray(result["boresight_visible"]).sum()) == 76
+        assert int(np.asarray(result["visible"]).sum()) == 66
+
     def test_dynamic_st_defaults_off(self, line1, line2):
         """use_dynamic_earthlimb_st defaults to False."""
         vis = Visibility(line1, line2)

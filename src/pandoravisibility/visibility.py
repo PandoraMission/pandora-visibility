@@ -1633,6 +1633,44 @@ class Visibility:
                 )
             bs_orb = np.asarray(bs_orb).ravel()
 
+            # ── Input-time quantities ─────────────────────────────
+            # Built before the roll sweep so that the sweep can break
+            # ties on how many *requested* steps each roll covers.
+            bu_inp = {name: unit[:, idx]
+                      for name, unit in pre_input_all["body_units"].items()}
+            zen_inp = pre_input_all["zenith_unit"][:, idx]
+            limb_inp = pre_input_all["limb_angle_rad"][idx]
+            N_chunk = len(idx)
+
+            # Boresight at input times (per-timestep target direction)
+            bs_inp = (
+                self._fast_sep_deg(bu_inp["moon"], chunk_tgt_b)
+                >= self.moon_min.to(u.deg).value
+            )
+            bs_inp &= (
+                self._fast_sep_deg(bu_inp["sun"], chunk_tgt_b)
+                >= self.sun_min.to(u.deg).value
+            )
+            bs_inp &= (
+                self._fast_limb_deg(chunk_tgt_b, zen_inp, limb_inp)
+                >= self._effective_earthlimb_min_deg(
+                    chunk_tgt_b, zen_inp, bu_inp["sun"],
+                    limb_angle_rad=limb_inp
+                )
+            )
+            if self.mars_min > 0 * u.deg:
+                bs_inp &= (
+                    self._fast_sep_deg(bu_inp["mars"], chunk_tgt_b)
+                    >= self.mars_min.to(u.deg).value
+                )
+            if self.jupiter_min > 0 * u.deg:
+                bs_inp &= (
+                    self._fast_sep_deg(bu_inp["jupiter"], chunk_tgt_b)
+                    >= self.jupiter_min.to(u.deg).value
+                )
+            bs_inp = np.asarray(bs_inp).ravel()
+            out_boresight[idx] = bs_inp
+
             best_orbit_roll = np.nan
 
             if self._st_constraint_active and bs_orb.any():
@@ -1674,6 +1712,36 @@ class Visibility:
                 best_count = vis_count.max()
                 if best_count > 0:
                     candidates = np.where(vis_count == best_count)[0]
+
+                    # The orbit window is sampled far more finely than the
+                    # requested times, so its visible count is coarse and
+                    # many rolls tie on it.  Prefer whichever of those
+                    # covers the most *requested* steps: staying inside the
+                    # tied set means orbit coverage is never given up, while
+                    # the caller's own timesteps stop being decided by the
+                    # solar-power tie-break, which knows nothing about them.
+                    if candidates.size > 1 and bs_inp.any():
+                        x_cand, y_cand = self._roll_attitude_batch(
+                            tgt_unit, roll_rads[candidates]
+                        )
+                        z_col_cand = np.tile(
+                            tgt_unit.reshape(3, 1), (1, N_chunk)
+                        )
+                        t1_cand = self._sweep_tracker(
+                            x_cand, y_cand, z_col_cand, st1_body, st1_checks,
+                            bu_inp, zen_inp, limb_inp, tracker=1,
+                        )
+                        t2_cand = self._sweep_tracker(
+                            x_cand, y_cand, z_col_cand, st2_body, st2_checks,
+                            bu_inp, zen_inp, limb_inp, tracker=2,
+                        )
+                        if self.st_required == 1:
+                            st_cand = t1_cand | t2_cand
+                        else:
+                            st_cand = t1_cand & t2_cand
+                        inp_count = (bs_inp[np.newaxis, :] & st_cand).sum(axis=1)
+                        candidates = candidates[inp_count == inp_count.max()]
+
                     avg_power = np.array([
                         solar_orb[r, vis_orb[r]].mean()
                         for r in candidates
@@ -1685,41 +1753,6 @@ class Visibility:
                     best_orbit_roll = (best_orbit_roll + 180) % 360 - 180
 
             # ── Evaluate at input times with orbit-optimal roll ───
-            bu_inp = {name: unit[:, idx]
-                      for name, unit in pre_input_all["body_units"].items()}
-            zen_inp = pre_input_all["zenith_unit"][:, idx]
-            limb_inp = pre_input_all["limb_angle_rad"][idx]
-            N_chunk = len(idx)
-
-            # Boresight at input times (per-timestep target direction)
-            bs_inp = (
-                self._fast_sep_deg(bu_inp["moon"], chunk_tgt_b)
-                >= self.moon_min.to(u.deg).value
-            )
-            bs_inp &= (
-                self._fast_sep_deg(bu_inp["sun"], chunk_tgt_b)
-                >= self.sun_min.to(u.deg).value
-            )
-            bs_inp &= (
-                self._fast_limb_deg(chunk_tgt_b, zen_inp, limb_inp)
-                >= self._effective_earthlimb_min_deg(
-                    chunk_tgt_b, zen_inp, bu_inp["sun"],
-                    limb_angle_rad=limb_inp
-                )
-            )
-            if self.mars_min > 0 * u.deg:
-                bs_inp &= (
-                    self._fast_sep_deg(bu_inp["mars"], chunk_tgt_b)
-                    >= self.mars_min.to(u.deg).value
-                )
-            if self.jupiter_min > 0 * u.deg:
-                bs_inp &= (
-                    self._fast_sep_deg(bu_inp["jupiter"], chunk_tgt_b)
-                    >= self.jupiter_min.to(u.deg).value
-                )
-            bs_inp = np.asarray(bs_inp).ravel()
-            out_boresight[idx] = bs_inp
-
             if np.isnan(best_orbit_roll):
                 # No roll satisfied ST constraints for this orbit;
                 # out_visible remains False, out_roll stays NaN.
