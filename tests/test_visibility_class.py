@@ -531,6 +531,119 @@ class TestStarTrackerConstraints:
     def test_time(self):
         return Time("2025-01-01T00:00:00")
 
+    @pytest.fixture
+    def breakdown_vis(self, line1, line2):
+        return Visibility(
+            line1, line2,
+            st_sun_min=50 * u.deg,
+            st_moon_min=20 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_required=1,
+        )
+
+    def test_breakdown_combined_matches_constraint(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """combined reproduces get_star_tracker_constraint exactly."""
+        times = test_time + np.arange(300) * u.min
+        breakdown = breakdown_vis.get_star_tracker_breakdown(target_coord, times)
+        engine = np.asarray(
+            breakdown_vis.get_star_tracker_constraint(target_coord, times)
+        )
+        assert np.array_equal(
+            np.asarray(breakdown["passed"]["combined"]), engine
+        )
+
+    def test_breakdown_rows_reconstruct_tracker(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """ANDing one tracker's per-check rows gives that tracker's verdict."""
+        times = test_time + np.arange(300) * u.min
+        breakdown = breakdown_vis.get_star_tracker_breakdown(target_coord, times)
+        for tracker in (1, 2):
+            rows = [
+                mask for name, mask in breakdown["passed"].items()
+                if name.startswith(f"ST{tracker} ")
+            ]
+            assert rows, f"no per-check rows for ST{tracker}"
+            recon = np.ones(len(times), dtype=bool)
+            for mask in rows:
+                recon &= np.asarray(mask)
+            assert np.array_equal(
+                recon, np.asarray(breakdown["passed"][f"ST{tracker}"])
+            )
+
+    def test_breakdown_only_lists_active_checks(self, line1, line2, target_coord,
+                                                test_time):
+        """Switched-off keep-outs get no row; per-tracker limits are honoured."""
+        vis = Visibility(
+            line1, line2,
+            st_sun_min=44 * u.deg,
+            st1_earthlimb_min=30 * u.deg,
+            st_required=1,
+        )
+        breakdown = vis.get_star_tracker_breakdown(target_coord, test_time)
+        rows = set(breakdown["passed"])
+        assert "ST1 sun" in rows and "ST2 sun" in rows
+        assert "ST1 limb" in rows          # per-tracker override is active
+        assert "ST2 limb" not in rows      # falls back to st_earthlimb_min = 0
+        assert not any(r.endswith(" moon") for r in rows)
+        assert breakdown["limits"]["ST1 limb"] == 30 * u.deg
+
+    def test_breakdown_separations_drive_the_masks(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """Each row's mask is exactly its separation against its limit."""
+        times = test_time + np.arange(200) * u.min
+        breakdown = breakdown_vis.get_star_tracker_breakdown(target_coord, times)
+        for name, mask in breakdown["passed"].items():
+            if name in ("ST1", "ST2", "combined"):
+                continue
+            sep = np.asarray(breakdown["separations"][name], dtype=float)
+            limit = breakdown["limits"][name].to(u.deg).value
+            assert np.array_equal(np.asarray(mask), sep >= limit)
+
+    def test_breakdown_scalar_time_returns_bools(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """Scalar time gives plain bools, matching the array path."""
+        times = test_time + np.arange(5) * u.min
+        scalar = breakdown_vis.get_star_tracker_breakdown(target_coord, times[0])
+        array = breakdown_vis.get_star_tracker_breakdown(target_coord, times)
+        for name, value in scalar["passed"].items():
+            assert isinstance(value, bool), f"{name} is {type(value).__name__}"
+            assert value == bool(np.asarray(array["passed"][name])[0])
+
+    def test_breakdown_roll_override_flows_through(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """A roll override changes the rows and the combined verdict together."""
+        times = test_time + np.arange(200) * u.min
+        at_0 = breakdown_vis.get_star_tracker_breakdown(
+            target_coord, times, roll=0 * u.deg)
+        at_90 = breakdown_vis.get_star_tracker_breakdown(
+            target_coord, times, roll=90 * u.deg)
+        assert not np.array_equal(
+            np.asarray(at_0["passed"]["combined"]),
+            np.asarray(at_90["passed"]["combined"]),
+        )
+        # and each stays internally consistent
+        for breakdown in (at_0, at_90):
+            recon = np.ones(len(times), dtype=bool)
+            for name, mask in breakdown["passed"].items():
+                if name.startswith("ST1 "):
+                    recon &= np.asarray(mask)
+            assert np.array_equal(recon, np.asarray(breakdown["passed"]["ST1"]))
+
+    def test_breakdown_requires_angle_quantity_for_roll(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """A bare number for roll is rejected, as elsewhere in the API."""
+        with pytest.raises(TypeError, match="roll"):
+            breakdown_vis.get_star_tracker_breakdown(
+                target_coord, test_time, roll=45
+            )
+
     def test_st_defaults_are_zero(self, line1, line2):
         """Star tracker constraints default to 0 (disabled)."""
         vis = Visibility(line1, line2)

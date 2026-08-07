@@ -969,6 +969,112 @@ class Visibility:
             return bool(result)
         return np.asarray(result)
 
+    def _st_tracker_separations(self, tgt_unit, time, pre, *,
+                                effective_roll=None):
+        """Keep-out separations for both star trackers, in degrees.
+
+        The single place the tracker attitude and geometry are evaluated.
+        ``_get_st_constraint_fast`` reduces this to a pass/fail verdict and
+        ``get_star_tracker_breakdown`` reports it check by check, so a
+        breakdown can never disagree with the verdict it explains.
+
+        All three separations are returned for each tracker whether or not
+        the corresponding keep-out is switched on; they are dot products
+        over vectors already in hand, so computing the unused ones is free.
+
+        Parameters
+        ----------
+        tgt_unit : np.ndarray
+            Target direction as (3,) unit vector in GCRS.
+        time : Time
+            Observation time (scalar or array).
+        pre : dict
+            Precomputed data from ``_precompute()``.
+        effective_roll : Quantity or None
+            Roll angle to use.  If ``None``, falls back to ``self.roll``.
+
+        Returns
+        -------
+        separations : dict
+            ``{1: {"sun_angle": ..., "moon_angle": ..., "earthlimb_angle": ...},
+            2: {...}}``, each value a float or (N,) array of degrees.  NaN
+            wherever the attitude is degenerate, which compares False
+            against any threshold.
+        degenerate : bool or np.ndarray of bool
+            True where the attitude is undefined (target aligned with the
+            Sun, so ``Sun x Z`` does not define a payload +Y).
+        """
+        roll = effective_roll if effective_roll is not None else self.roll
+        body_units = pre["body_units"]
+        zenith_unit = pre["zenith_unit"]
+        limb_rad = pre["limb_angle_rad"]
+        sun_vec = body_units["sun"]
+
+        # Compute payload attitude ONCE for both trackers
+        if roll is not None:
+            roll_rad = roll.to(u.rad).value
+            x_payload, y_payload = self._roll_attitude(tgt_unit, roll_rad)
+            if time.isscalar:
+                z_col = tgt_unit
+                degenerate = False
+            else:
+                N = len(time)
+                z_col = np.tile(tgt_unit.reshape(3, 1), (1, N))
+                x_payload = x_payload[:, np.newaxis]  # (3,) → (3,1)
+                y_payload = y_payload[:, np.newaxis]  # (3,) → (3,1)
+                degenerate = np.zeros(N, dtype=bool)
+        elif time.isscalar:
+            z_col = tgt_unit
+            y_payload = np.cross(sun_vec, tgt_unit)
+            y_norm = np.linalg.norm(y_payload)
+            degenerate = bool(y_norm < 1e-10)
+            y_payload = y_payload / (1.0 if degenerate else y_norm)
+            x_payload = np.cross(y_payload, tgt_unit)
+            x_norm = np.linalg.norm(x_payload)
+            x_payload = x_payload / (1.0 if x_norm < 1e-10 else x_norm)
+        else:
+            N = len(time)
+            z_col = np.tile(tgt_unit.reshape(3, 1), (1, N))
+            y_payload = np.cross(sun_vec, z_col, axis=0)
+            y_norms = np.linalg.norm(y_payload, axis=0, keepdims=True)
+            degenerate = (y_norms < 1e-10).ravel()
+            y_payload = y_payload / np.where(y_norms < 1e-10, 1.0, y_norms)
+            x_payload = np.cross(y_payload, z_col, axis=0)
+            x_norms = np.linalg.norm(x_payload, axis=0, keepdims=True)
+            x_payload = x_payload / np.where(x_norms < 1e-10, 1.0, x_norms)
+
+        separations = {}
+        for tracker in [1, 2]:
+            st_body = np.array(self._get_star_tracker_body_xyz(tracker))
+
+            # Rotate body-frame vector to ECI
+            st_eci = (
+                x_payload * st_body[0]
+                + y_payload * st_body[1]
+                + z_col * st_body[2]
+            )
+
+            if time.isscalar:
+                st_norm = np.linalg.norm(st_eci)
+                if st_norm < 1e-10 or degenerate:
+                    st_eci = np.full(3, np.nan)
+                else:
+                    st_eci = st_eci / st_norm
+            else:
+                st_eci = st_eci / np.linalg.norm(st_eci, axis=0, keepdims=True)
+                st_eci[:, degenerate] = np.nan
+
+            with np.errstate(invalid="ignore"):
+                separations[tracker] = {
+                    "sun_angle": self._fast_sep_deg(st_eci, body_units["sun"]),
+                    "moon_angle": self._fast_sep_deg(st_eci, body_units["moon"]),
+                    "earthlimb_angle": self._fast_limb_deg(
+                        st_eci, zenith_unit, limb_rad
+                    ),
+                }
+
+        return separations, degenerate
+
     def _get_st_constraint_fast(self, tgt_unit, time, pre, *,
                                 effective_roll=None):
         """Star tracker constraint check using pure numpy.
@@ -988,84 +1094,25 @@ class Visibility:
         effective_roll : Quantity or None
             Roll angle to use.  If ``None``, falls back to ``self.roll``.
         """
-        roll = effective_roll if effective_roll is not None else self.roll
-        body_units = pre["body_units"]
-        zenith_unit = pre["zenith_unit"]
-        limb_rad = pre["limb_angle_rad"]
-        sun_vec = body_units["sun"]
+        separations, degenerate = self._st_tracker_separations(
+            tgt_unit, time, pre, effective_roll=effective_roll,
+        )
 
-        # Compute payload attitude ONCE for both trackers
-        if roll is not None:
-            roll_rad = roll.to(u.rad).value
-            x_payload, y_payload = self._roll_attitude(tgt_unit, roll_rad)
-            if time.isscalar:
-                z_col = tgt_unit
-            else:
-                N = len(time)
-                z_col = np.tile(tgt_unit.reshape(3, 1), (1, N))
-                x_payload = x_payload[:, np.newaxis]  # (3,) → (3,1)
-                y_payload = y_payload[:, np.newaxis]  # (3,) → (3,1)
-                degenerate = np.zeros(N, dtype=bool)
-        elif time.isscalar:
-            y_payload = np.cross(sun_vec, tgt_unit)
-            y_norm = np.linalg.norm(y_payload)
-            if y_norm < 1e-10:
-                return False  # degenerate: both trackers fail
-            y_payload = y_payload / y_norm
-            x_payload = np.cross(y_payload, tgt_unit)
-            x_payload = x_payload / np.linalg.norm(x_payload)
-            z_col = tgt_unit
-        else:
-            N = len(time)
-            z_col = np.tile(tgt_unit.reshape(3, 1), (1, N))
-            y_payload = np.cross(sun_vec, z_col, axis=0)
-            y_norms = np.linalg.norm(y_payload, axis=0, keepdims=True)
-            degenerate = (y_norms < 1e-10).ravel()
-            y_payload = y_payload / np.where(y_norms < 1e-10, 1.0, y_norms)
-            x_payload = np.cross(y_payload, z_col, axis=0)
-            x_norms = np.linalg.norm(x_payload, axis=0, keepdims=True)
-            x_payload = x_payload / np.where(x_norms < 1e-10, 1.0, x_norms)
+        if time.isscalar and degenerate:
+            return False  # degenerate: both trackers fail
 
         tracker_results = []
-
         for tracker in [1, 2]:
-            checks = self._st_checks_for(tracker)
-            st_body = np.array(self._get_star_tracker_body_xyz(tracker))
-
-            # Rotate body-frame vector to ECI
-            st_eci = (
-                x_payload * st_body[0]
-                + y_payload * st_body[1]
-                + z_col * st_body[2]
-            )
-
-            if time.isscalar:
-                st_norm = np.linalg.norm(st_eci)
-                if st_norm < 1e-10:
-                    tracker_results.append(False)
-                    continue
-                st_eci = st_eci / st_norm
-            else:
-                st_eci = st_eci / np.linalg.norm(st_eci, axis=0, keepdims=True)
-                st_eci[:, degenerate] = np.nan
-
-            # Check each constraint via dot-product separation
             if time.isscalar:
                 tracker_ok = True
             else:
                 tracker_ok = np.ones(time.shape, dtype=bool)
 
-            for _, limit, key in checks:
-                limit_deg = limit.to(u.deg).value
-                if key == "sun_angle":
-                    sep = self._fast_sep_deg(st_eci, body_units["sun"])
-                elif key == "moon_angle":
-                    sep = self._fast_sep_deg(st_eci, body_units["moon"])
-                elif key == "earthlimb_angle":
-                    sep = self._fast_limb_deg(st_eci, zenith_unit, limb_rad)
-                else:
+            for _, limit, key in self._st_checks_for(tracker):
+                sep = separations[tracker].get(key)
+                if sep is None:
                     continue
-                tracker_ok = tracker_ok & (sep >= limit_deg)
+                tracker_ok = tracker_ok & (sep >= limit.to(u.deg).value)
 
             tracker_results.append(tracker_ok)
 
@@ -2120,6 +2167,115 @@ class Visibility:
             target_unit = target_unit[:, 0].copy()
 
         return self._get_st_constraint_fast(target_unit, time, pre)
+
+    def get_star_tracker_breakdown(self, target_coord: SkyCoord, time: Time,
+                                   roll=None, pre: dict = None) -> dict:
+        """Which star tracker fails which keep-out, check by check.
+
+        ``get_star_tracker_constraint`` answers "did the trackers pass?".
+        This answers "and if not, which one, on what?" — useful for
+        diagnosing why a target dropped out.
+
+        Shares ``_st_tracker_separations`` with the constraint check
+        itself, so the per-check masks always reconstruct the verdict:
+        ``result["passed"]["combined"]`` equals
+        ``get_star_tracker_constraint(...)`` exactly.
+
+        Parameters
+        ----------
+        target_coord : SkyCoord
+            The science target coordinate (+Z boresight direction).
+        time : Time
+            Observation time(s), scalar or array.
+        roll : Quantity, optional
+            Roll angle about the boresight for this call only.  ``None``
+            keeps the instance value, which itself defaults to the
+            Sun-constrained attitude.
+        pre : dict, optional
+            Precomputed data from ``_precompute``.
+
+        Returns
+        -------
+        dict
+            passed : dict
+                Boolean *pass* masks keyed ``"ST1 sun"``, ``"ST1 moon"``,
+                ``"ST1 limb"`` and the ST2 equivalents, one entry per
+                *active* check per tracker; plus ``"ST1"`` / ``"ST2"`` for
+                each tracker overall and ``"combined"`` for the
+                ``st_required`` verdict.
+            separations : dict
+                The angle behind each per-check entry, in degrees.  NaN
+                where the attitude is degenerate.
+            limits : dict
+                The threshold applied to each per-check entry, a Quantity.
+
+        Examples
+        --------
+        >>> br = vis.get_star_tracker_breakdown(target, times)
+        >>> for name, ok in br["passed"].items():
+        ...     print(f"{name:<10} fails at {int((~ok).sum()):>4} steps")
+        """
+        if roll is not None:
+            _validate_angle(roll, "roll")
+            effective_roll = roll.to(u.deg)
+        else:
+            effective_roll = self.roll
+
+        if pre is None:
+            pre = self._precompute(time)
+        target_unit = self._target_unit(target_coord, time)
+        if not time.isscalar:
+            target_unit = target_unit[:, 0].copy()
+
+        separations, degenerate = self._st_tracker_separations(
+            target_unit, time, pre, effective_roll=effective_roll,
+        )
+
+        # "limb" rather than "earthlimb" keeps the row labels short; the
+        # names come from _st_checks_for so only active checks appear.
+        passed, seps_out, limits_out = {}, {}, {}
+        tracker_overall = {}
+        for tracker in [1, 2]:
+            if time.isscalar:
+                tracker_ok = True
+            else:
+                tracker_ok = np.ones(time.shape, dtype=bool)
+
+            for name, limit, key in self._st_checks_for(tracker):
+                sep = separations[tracker][key]
+                ok = sep >= limit.to(u.deg).value
+                row = f"ST{tracker} {name}"
+                passed[row] = bool(ok) if time.isscalar else np.asarray(ok)
+                seps_out[row] = sep
+                limits_out[row] = limit
+                tracker_ok = tracker_ok & ok
+
+            tracker_overall[tracker] = (
+                bool(tracker_ok) if time.isscalar else np.asarray(tracker_ok)
+            )
+
+        passed["ST1"] = tracker_overall[1]
+        passed["ST2"] = tracker_overall[2]
+
+        # Reduce exactly as _get_st_constraint_fast does, rather than
+        # calling get_star_tracker_constraint, which would ignore a roll
+        # override and disagree with the per-check rows above.
+        if not self._st_constraint_active:
+            passed["combined"] = (
+                True if time.isscalar else np.ones(time.shape, dtype=bool)
+            )
+        elif time.isscalar and degenerate:
+            passed["combined"] = False
+        elif self.st_required == 1:
+            passed["combined"] = tracker_overall[1] | tracker_overall[2]
+        else:
+            passed["combined"] = tracker_overall[1] & tracker_overall[2]
+
+        return {
+            "passed": passed,
+            "separations": seps_out,
+            "limits": limits_out,
+        }
 
     def get_all_constraints(self, target_coord: SkyCoord, time: Time) -> dict:
         """Get status of all active constraints.
