@@ -14,46 +14,22 @@ _R_EARTH_M = R_earth.to(u.m).value
 # nominal Earth angular radius converts it to the limb-referenced angle used
 # everywhere else in this module.
 #
-# The curve is anchored at three points — (78, bright), (89, 82) and (90, 75)
-# — flat outside them and straight lines in between, so it is continuous.
-# Only the bright anchor differs between the boresight and the star trackers;
-# the knee and the dark shelf are shared.
+# A wedge is a list of ``(illumination, keep-out)`` anchors, read as a
+# continuous piecewise-linear curve: flat at the first anchor's value below
+# it, straight lines between anchors, flat at the last anchor's value above
+# it.  The boresight and the star trackers have independent anchors — the
+# trackers tolerate a far brighter Earth, so their curve stays flat well past
+# the terminator and only relaxes over a properly dark limb.
 _DYN_EARTH_ANGULAR_RADIUS_DEG = 66.0
-_DYN_BRIGHT_ILLUM_DEG, _DYN_BRIGHT_KEEPOUT_DEG = 78.0, 110.0
-_DYN_KNEE_ILLUM_DEG, _DYN_KNEE_KEEPOUT_DEG = 89.0, 82.0
-_DYN_DARK_ILLUM_DEG, _DYN_DARK_KEEPOUT_DEG = 90.0, 75.0
 
-# Star tracker bright anchor: 96 deg from the Earth centre, i.e. 30 deg above
-# the limb once the nominal Earth angular radius is removed, against the
-# boresight's 110 - 66 = 44 deg.  The trackers tolerate a brighter Earth than
-# the science detector, so their wedge sits lower on the day side but rejoins
-# the boresight curve at the knee and on the dark shelf.
-_DYN_ST_BRIGHT_KEEPOUT_DEG = 96.0
+# Boresight: 110 deg from the Earth centre over a bright limb (44 deg above
+# the limb), through the knee at 89 deg, easing to 75 deg (9 deg above it).
+_DYN_BORESIGHT_ANCHORS_DEG = ((78.0, 110.0), (89.0, 82.0), (90.0, 75.0))
 
-
-def _dyn_rule1_fit(bright_keepout_deg):
-    """Slope and intercept of rule 1 (78 - 89 deg) for one bright anchor.
-
-    Rule 1 is the only segment that depends on the bright anchor, so both
-    the boresight and star tracker wedges come from this one fit rather
-    than two hand-written copies of the same algebra.
-    """
-    slope = (
-        (_DYN_KNEE_KEEPOUT_DEG - bright_keepout_deg)
-        / (_DYN_KNEE_ILLUM_DEG - _DYN_BRIGHT_ILLUM_DEG)
-    )
-    return slope, bright_keepout_deg - slope * _DYN_BRIGHT_ILLUM_DEG
-
-
-# Rule 1 (78 - 89 deg) and rule 2 (89 - 90 deg) linear fits through the anchors
-_DYN_RULE1_M, _DYN_RULE1_B = _dyn_rule1_fit(_DYN_BRIGHT_KEEPOUT_DEG)
-_DYN_ST_RULE1_M, _DYN_ST_RULE1_B = _dyn_rule1_fit(_DYN_ST_BRIGHT_KEEPOUT_DEG)
-# Rule 2 runs between the shared knee and dark anchors, so it is common to both.
-_DYN_RULE2_M = (
-    (_DYN_DARK_KEEPOUT_DEG - _DYN_KNEE_KEEPOUT_DEG)
-    / (_DYN_DARK_ILLUM_DEG - _DYN_KNEE_ILLUM_DEG)
-)
-_DYN_RULE2_B = _DYN_KNEE_KEEPOUT_DEG - _DYN_RULE2_M * _DYN_KNEE_ILLUM_DEG
+# Star trackers: 85 deg from the Earth centre (19 deg above the limb) at every
+# illumination up to 102.5 deg, then a straight line down to 68 deg (2 deg
+# above the limb) at 120 deg, held there over any darker limb.
+_DYN_ST_ANCHORS_DEG = ((102.5, 85.0), (120.0, 68.0))
 
 
 def _validate_angle(value, name):
@@ -146,9 +122,10 @@ class Visibility:
     ST_MOON_MIN = 0 * u.deg
     ST_EARTHLIMB_MIN = 0 * u.deg
     # True = star tracker Earth limb keep-out follows the ST DPC wedge
-    # (30 deg above the limb over a bright Earth, easing to 9 deg over a
-    # dark one) instead of the flat ST_EARTHLIMB_MIN.  Independent of
-    # USE_DYNAMIC_EARTHLIMB, which does the same for the boresight.
+    # (19 deg above the limb out to 102.5 deg of illumination, easing to
+    # 2 deg over a dark limb) instead of the flat ST_EARTHLIMB_MIN.
+    # Independent of USE_DYNAMIC_EARTHLIMB, which does the same for the
+    # boresight, and a different curve from it.
     USE_DYNAMIC_EARTHLIMB_ST = False
     ST1_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
     ST2_EARTHLIMB_MIN = None  # Per-tracker override (None = use ST_EARTHLIMB_MIN)
@@ -650,24 +627,20 @@ class Visibility:
         return np.rad2deg(np.arccos(np.clip(dot_n_sun, -1.0, 1.0)))
 
     @staticmethod
-    def _dynamic_wedge_deg(illumination_deg, bright_keepout_deg,
-                           rule1_m, rule1_b):
+    def _dynamic_wedge_deg(illumination_deg, anchors_deg):
         """Evaluate one DPC wedge, in degrees above the limb.
 
         Shared by the boresight and star tracker wedges, which differ only
-        in their bright anchor and the rule 1 fit that follows from it.
+        in their anchor points.
 
         Parameters
         ----------
         illumination_deg : float or ndarray
             Earth illumination angle(s) in degrees.  Any angle is
             accepted; it is folded into [0, 180] before evaluation.
-        bright_keepout_deg : float
-            Keep-out from the Earth centre on the bright shelf
-            (illumination <= 78 deg).
-        rule1_m, rule1_b : float
-            Slope and intercept of the 78 - 89 deg segment, from
-            ``_dyn_rule1_fit(bright_keepout_deg)``.
+        anchors_deg : sequence of (float, float)
+            ``(illumination, keep-out from Earth centre)`` pairs in
+            increasing illumination order, e.g. ``_DYN_ST_ANCHORS_DEG``.
 
         Returns
         -------
@@ -679,18 +652,12 @@ class Visibility:
         illum = np.abs(
             (np.asarray(illumination_deg, dtype=float) + 180.0) % 360.0 - 180.0
         )
-        keepout = np.where(
-            illum < _DYN_BRIGHT_ILLUM_DEG,
-            bright_keepout_deg,
-            np.where(
-                illum <= _DYN_KNEE_ILLUM_DEG,
-                rule1_m * illum + rule1_b,
-                np.where(
-                    illum < _DYN_DARK_ILLUM_DEG,
-                    _DYN_RULE2_M * illum + _DYN_RULE2_B,
-                    _DYN_DARK_KEEPOUT_DEG,
-                ),
-            ),
+        # np.interp holds the end values beyond the outermost anchors, which
+        # is exactly the flat shelf on either side of the ramp.
+        keepout = np.interp(
+            illum,
+            [anchor[0] for anchor in anchors_deg],
+            [anchor[1] for anchor in anchors_deg],
         )
         return keepout - _DYN_EARTH_ANGULAR_RADIUS_DEG
 
@@ -734,31 +701,33 @@ class Visibility:
             Minimum allowed angle above the Earth limb, in degrees.
         """
         return Visibility._dynamic_wedge_deg(
-            illumination_deg, _DYN_BRIGHT_KEEPOUT_DEG,
-            _DYN_RULE1_M, _DYN_RULE1_B,
+            illumination_deg, _DYN_BORESIGHT_ANCHORS_DEG
         )
 
     @staticmethod
     def _dynamic_st_earthlimb_min_deg(illumination_deg):
         """Star tracker DPC wedge keep-out in degrees above the limb.
 
-        The same shape as the boresight wedge, but anchored at 96 deg from
-        the Earth centre on the bright shelf instead of 110 deg, because
-        the trackers tolerate a brighter Earth than the science detector:
+        An independent curve from the boresight wedge, not a rescaling of
+        it: the trackers hold one keep-out across the whole day side and
+        well past the terminator, then relax over a genuinely dark limb.
 
         ===================  ===========================
         Illumination angle   Keep-out from Earth centre
         ===================  ===========================
-        <= 78 deg            96 deg
-        78 - 89 deg          linear rule 1 (96 → 82 deg)
-        89 - 90 deg          linear rule 2 (82 → 75 deg)
-        >= 90 deg            75 deg
+        <= 102.5 deg         85 deg
+        102.5 - 120 deg      linear (85 → 68 deg)
+        >= 120 deg           68 deg
         ===================  ===========================
 
-        Only rule 1 differs; the knee and the dark shelf are shared with
-        the boresight curve.  Referenced to the limb that is 30 deg on the
-        bright shelf, matching the flat ``st_earthlimb_min`` this replaces,
-        easing to 9 deg over a fully dark limb.
+        The single ramp is a straight line through the anchors, so the
+        curve is continuous at 102.5 and 120 deg.
+
+        Referenced to the limb that is a flat 19 deg out to 102.5 deg of
+        illumination, easing to 2 deg over a fully dark limb.  Note this is
+        *tighter* than the boresight wedge on the night side (9 deg there),
+        so the trackers, not the boresight, can be the binding constraint
+        over a dark Earth.
 
         Parameters
         ----------
@@ -772,8 +741,7 @@ class Visibility:
             Minimum allowed angle above the Earth limb, in degrees.
         """
         return Visibility._dynamic_wedge_deg(
-            illumination_deg, _DYN_ST_BRIGHT_KEEPOUT_DEG,
-            _DYN_ST_RULE1_M, _DYN_ST_RULE1_B,
+            illumination_deg, _DYN_ST_ANCHORS_DEG
         )
 
     @staticmethod
@@ -1907,8 +1875,8 @@ class Visibility:
         With ``use_dynamic_earthlimb_st`` the threshold follows the ST DPC
         wedge, evaluated from the illumination angle at the limb point that
         *this tracker* grazes — so each tracker gets its own threshold, and
-        a tracker looking at a dark limb is held to 9 deg while one looking
-        at a bright limb is held to 30 deg.  Otherwise it is the flat
+        a tracker looking at a dark limb is held to 2 deg while one looking
+        at a bright limb is held to 19 deg.  Otherwise it is the flat
         per-tracker ``st_earthlimb_min``.
 
         The single source of the ST limb threshold: the constraint check,

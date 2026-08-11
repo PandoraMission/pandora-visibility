@@ -617,9 +617,11 @@ class TestStarTrackerConstraints:
         """The tie-break wins back steps the power-only choice gave away.
 
         Pinned so that reverting to the solar-power-only tie-break fails
-        here: this configuration returned 61 visible steps when ties were
-        settled on solar power alone, and 66 once the requested timesteps
-        settle them first.
+        here: this configuration returns 55 visible steps when ties are
+        settled on solar power alone, and 61 once the requested timesteps
+        settle them first.  (The counts depend on the ST DPC wedge, so they
+        move whenever ``_DYN_ST_ANCHORS_DEG`` does; the 6-step gain is the
+        part that matters.)
         """
         vis = Visibility(line1, line2, st_sun_min=50 * u.deg,
                          st_moon_min=20 * u.deg, st_required=1,
@@ -628,7 +630,7 @@ class TestStarTrackerConstraints:
         times = Time("2026-02-15T18:00:00") + np.arange(0, 1440, 10) * u.min
         result = vis.get_visibility_best_roll(target, times)
         assert int(np.asarray(result["boresight_visible"]).sum()) == 76
-        assert int(np.asarray(result["visible"]).sum()) == 66
+        assert int(np.asarray(result["visible"]).sum()) == 61
 
     def test_dynamic_st_defaults_off(self, line1, line2):
         """use_dynamic_earthlimb_st defaults to False."""
@@ -637,39 +639,51 @@ class TestStarTrackerConstraints:
         assert Visibility.USE_DYNAMIC_EARTHLIMB_ST is False
 
     @pytest.mark.parametrize("illum,expected", [
-        (0.0, 30.0),      # bright shelf: 96 - 66
-        (50.0, 30.0),
-        (78.0, 30.0),     # bright anchor
-        (83.5, 23.0),     # midpoint of rule 1
-        (89.0, 16.0),     # knee, shared with the boresight wedge
-        (89.5, 12.5),     # midpoint of rule 2
-        (90.0, 9.0),      # dark anchor
-        (180.0, 9.0),     # dark shelf
+        (0.0, 19.0),       # bright shelf: 85 - 66
+        (50.0, 19.0),
+        (90.0, 19.0),      # still flat past the terminator
+        (102.5, 19.0),     # bright anchor, where the ramp starts
+        (111.25, 10.5),    # midpoint of the ramp
+        (120.0, 2.0),      # dark anchor: 68 - 66
+        (180.0, 2.0),      # dark shelf
     ])
     def test_dynamic_st_wedge_anchors(self, illum, expected):
-        """ST wedge is 30 deg over a bright limb, easing to 9 deg over a dark one."""
+        """ST wedge is 19 deg out to 102.5 deg illumination, easing to 2 deg."""
         got = float(Visibility._dynamic_st_earthlimb_min_deg(illum))
         assert got == pytest.approx(expected)
 
-    def test_dynamic_st_wedge_never_exceeds_boresight(self):
-        """The ST wedge is never tighter than the boresight wedge."""
-        illum = np.linspace(0.0, 180.0, 1801)
-        st = np.asarray(Visibility._dynamic_st_earthlimb_min_deg(illum))
-        bs = np.asarray(Visibility._dynamic_earthlimb_min_deg(illum))
-        assert np.all(st <= bs + 1e-9)
-        # and they coincide from the knee onwards
-        assert np.allclose(st[illum >= 89.0], bs[illum >= 89.0])
+    def test_dynamic_st_wedge_is_independent_of_boresight(self):
+        """The ST wedge is its own curve, not a rescaling of the boresight one.
+
+        The two cross twice: the trackers are the looser constraint over a
+        bright Earth and again over a fully dark one, but the *tighter* one
+        across the terminator, which the old shared curve could never be.
+        """
+        st = Visibility._dynamic_st_earthlimb_min_deg
+        bs = Visibility._dynamic_earthlimb_min_deg
+        for illum in (0.0, 50.0, 78.0):
+            assert float(st(illum)) < float(bs(illum))
+        for illum in (89.0, 95.0, 102.5):
+            assert float(st(illum)) > float(bs(illum))
+        for illum in (120.0, 150.0, 180.0):
+            assert float(st(illum)) < float(bs(illum))
+
+    def test_dynamic_st_wedge_monotonic(self):
+        """Keep-out never rises as the limb darkens."""
+        st = np.asarray(Visibility._dynamic_st_earthlimb_min_deg(
+            np.linspace(0.0, 180.0, 1801)))
+        assert np.all(np.diff(st) <= 1e-9)
 
     def test_dynamic_st_wedge_continuous(self):
-        """No jump at the 78 / 89 / 90 deg knots."""
-        for knot in (78.0, 89.0, 90.0):
+        """No jump at the 102.5 / 120 deg knots."""
+        for knot in (102.5, 120.0):
             lo = float(Visibility._dynamic_st_earthlimb_min_deg(knot - 1e-6))
             hi = float(Visibility._dynamic_st_earthlimb_min_deg(knot + 1e-6))
             assert abs(hi - lo) < 1e-4
 
     def test_dynamic_st_wedge_folds_like_boresight(self):
         """Angles outside [0, 180] fold onto the same keep-out."""
-        for illum in (0.0, 45.0, 83.5, 89.5, 120.0):
+        for illum in (0.0, 45.0, 102.5, 111.25, 120.0, 150.0):
             base = float(Visibility._dynamic_st_earthlimb_min_deg(illum))
             for equivalent in (-illum, illum + 360.0, 360.0 - illum):
                 assert float(
@@ -739,8 +753,8 @@ class TestStarTrackerConstraints:
         assert st1.shape == times.shape       # per-timestep, not scalar
         assert not np.allclose(st1, st2)      # the trackers differ
         for arr in (st1, st2):
-            assert arr.min() >= 9.0 - 1e-9
-            assert arr.max() <= 30.0 + 1e-9
+            assert arr.min() >= 2.0 - 1e-9
+            assert arr.max() <= 19.0 + 1e-9
 
     def test_dynamic_st_best_roll_agrees_with_breakdown(self, line1, line2,
                                                         target_coord, test_time):
