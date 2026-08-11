@@ -2,6 +2,8 @@
 Tests for Visibility class methods that are not covered in test_import.py
 """
 
+import pickle
+
 import numpy as np
 import pytest
 from astropy import units as u
@@ -2787,6 +2789,59 @@ class TestEphemerisStepAndCaching:
             x_one, y_one = Visibility._roll_attitude(z_unit, roll)
             np.testing.assert_allclose(x_all[i], x_one, atol=1e-14)
             np.testing.assert_allclose(y_all[i], y_one, atol=1e-14)
+
+    def test_pickle_round_trip_preserves_results(self, line1, line2, kwargs,
+                                                 targets, times):
+        """An unpickled instance answers exactly like the original.
+
+        Satrec cannot be pickled, so __getstate__ drops it and
+        __setstate__ rebuilds it from the TLE lines; this is what lets a
+        sweep hand one Visibility to a pool of worker processes.
+        """
+        vis = Visibility(line1, line2, ephemeris_step=60 * u.min, **kwargs)
+        clone = pickle.loads(pickle.dumps(vis))
+
+        assert repr(clone) == repr(vis)
+        assert clone.get_period() == vis.get_period()
+        for target in targets:
+            np.testing.assert_array_equal(
+                np.asarray(clone.get_visibility(target, times)),
+                np.asarray(vis.get_visibility(target, times)),
+            )
+
+    def test_pickle_carries_warm_caches_with_their_time_grid(
+            self, line1, line2, kwargs, targets, times):
+        """Pickled with its time grid, the cache arrives usable.
+
+        Both caches are keyed on the identity of the Time object, and
+        pickle preserves identity within a single pickle — which is what
+        lets worker processes start warm instead of each rebuilding the
+        same ephemeris.
+        """
+        vis = Visibility(line1, line2, ephemeris_step=60 * u.min, **kwargs)
+        vis.get_visibility(targets[0], times)
+        assert vis._precompute_cache_value is not None
+
+        clone, clone_times = pickle.loads(pickle.dumps((vis, times)))
+        assert clone._precompute_cache_time is clone_times
+
+        # A hit, not a rebuild: the cached object comes back by identity.
+        cached = clone._precompute_cache_value
+        assert clone._precompute(clone_times) is cached
+
+    def test_pickle_alone_leaves_a_cache_that_cannot_hit(
+            self, line1, line2, kwargs, targets, times):
+        """Without its time grid the cache is dead weight, never a wrong hit."""
+        vis = Visibility(line1, line2, ephemeris_step=60 * u.min, **kwargs)
+        vis.get_visibility(targets[0], times)
+
+        clone = pickle.loads(pickle.dumps(vis))
+        assert clone._precompute_cache_time is not times
+        # Same grid by value, different object, so it recomputes rather
+        # than serving the entry that came along in the pickle.
+        stale = clone._precompute_cache_value
+        assert stale is not None
+        assert clone._precompute(times) is not stale
 
 
 class TestConstraintApiConsistency:

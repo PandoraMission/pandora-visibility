@@ -166,6 +166,10 @@ class Visibility:
             self.tle = Satrec.twoline2rv(line1, line2)
         except Exception as e:
             raise ValueError(f"Invalid TLE data: {e}")
+        # Kept so the instance can be pickled: Satrec is a C extension type
+        # that cannot be, so __setstate__ rebuilds it from these.
+        self.line1 = line1
+        self.line2 = line2
 
         # Validate units on any user-supplied angle parameters
         _angle_params = [
@@ -253,6 +257,33 @@ class Visibility:
         self._orbit_grid_cache_time = None
         self._orbit_grid_cache_key = None
         self._orbit_grid_cache_value = None
+
+    def __getstate__(self):
+        """Instance state for pickling, without the SGP4 propagator.
+
+        ``Satrec`` is a C extension type that cannot be pickled, so it is
+        left out and rebuilt from the TLE lines on the other side.  Making
+        the instance picklable is what lets a sweep hand one ``Visibility``
+        to a pool of worker processes.
+
+        The ephemeris and orbit-grid caches are kept, because they are the
+        expensive part: copying a few megabytes of arrays down a pipe beats
+        every worker spending seconds rebuilding them.  They arrive usable
+        only when the same pickle also carries the ``Time`` grid they were
+        built for — both caches are keyed on that object's identity, and
+        pickle preserves identity within a single pickle, so
+        ``dumps((visibility, times))`` arrives warm while ``dumps(visibility)``
+        alone arrives with a cache that can never hit.  Either way the keys
+        are checked before use, so a stale entry is never served.
+        """
+        state = self.__dict__.copy()
+        state.pop("tle", None)
+        return state
+
+    def __setstate__(self, state):
+        """Rebuild the propagator dropped by :meth:`__getstate__`."""
+        self.__dict__.update(state)
+        self.tle = Satrec.twoline2rv(self.line1, self.line2)
 
     def __repr__(self) -> str:
         """Return a string representation of the TLE object for debugging."""

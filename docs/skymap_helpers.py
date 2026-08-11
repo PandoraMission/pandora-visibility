@@ -16,7 +16,9 @@ Nothing here is Pandora-specific beyond the ``Visibility`` instance handed
 in, so the same functions work for any keep-out configuration.
 """
 
+import os
 import time as _clock
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 from astropy import units as u
@@ -177,9 +179,125 @@ def _format_duration(seconds):
     return f"{seconds // 60}m {seconds % 60:02d}s"
 
 
+# ----------------------------------------------------------------------
+# The sweep: one visibility solve per grid point
+# ----------------------------------------------------------------------
+
+def _grid_coords(ra_vals, dec_vals):
+    """Flattened SkyCoord for the RA/Dec grid, in row-major (Dec, RA) order."""
+    ra_grid, dec_grid = np.meshgrid(ra_vals, dec_vals)
+    return SkyCoord(ra=ra_grid.ravel() * u.deg, dec=dec_grid.ravel() * u.deg,
+                    frame="icrs")
+
+
+def _solve_point(visibility, coord, times, roll_step, orbit_time_step,
+                 step_minutes):
+    """
+    Everything one grid point contributes to the maps.
+
+    The single place a grid point is solved, so the in-process and the
+    worker-process sweeps cannot drift apart: both call this.
+
+    Returns
+    -------
+    tuple
+        ``(duty, boresight_duty, longest_window, n_windows, mean_roll,
+        roll_spread)``, with the last two NaN where no roll was chosen.
+    """
+    result = visibility.get_visibility_best_roll(
+        coord, times, roll_step=roll_step, orbit_time_step=orbit_time_step,
+    )
+    visible = np.asarray(result["visible"], dtype=bool)
+    runs = _run_lengths(visible)
+
+    duty = 100.0 * visible.mean()
+    boresight_duty = 100.0 * np.asarray(
+        result["boresight_visible"], dtype=bool
+    ).mean()
+    longest_window = runs.max() * step_minutes if runs.size else 0.0
+    n_windows = runs.size
+
+    # The roll angle is circular, so it is averaged as a unit vector: the
+    # arithmetic mean of -179 and +179 deg would be 0, which is the
+    # opposite attitude.  The resultant's length also gives the spread for
+    # free.
+    mean_roll = np.nan
+    roll_spread = np.nan
+    roll_deg = np.asarray(result["roll_deg"], dtype=float)
+    chosen = roll_deg[np.isfinite(roll_deg)]
+    if chosen.size:
+        resultant = np.exp(1j * np.deg2rad(chosen)).mean()
+        mean_roll = np.rad2deg(np.angle(resultant))
+        # Identical angles give a resultant length of 1 give or take
+        # rounding, and 1 + 1e-16 would send the log positive and the sqrt
+        # to NaN.  Clip both ends before taking either.
+        length = float(np.clip(abs(resultant), 1e-12, 1.0))
+        roll_spread = np.rad2deg(np.sqrt(-2.0 * np.log(length)))
+
+    return (duty, boresight_duty, longest_window, n_windows,
+            mean_roll, roll_spread)
+
+
+#: Per-process state for the worker pool, filled in by :func:`_worker_init`.
+#: Held at module level because a ``ProcessPoolExecutor`` initializer has
+#: nowhere else to put something the tasks must reuse — rebuilding the
+#: Visibility per task would throw away its ephemeris cache every time.
+_WORKER = {}
+
+
+def _worker_init(visibility, ra_vals, dec_vals, times, roll_step,
+                 orbit_time_step, step_minutes):
+    """Set up one worker process: unpickled once, reused for every chunk."""
+    _WORKER.update(
+        visibility=visibility,
+        coords=_grid_coords(ra_vals, dec_vals),
+        times=times,
+        roll_step=roll_step,
+        orbit_time_step=orbit_time_step,
+        step_minutes=step_minutes,
+    )
+
+
+def _worker_chunk(indices):
+    """Solve a block of grid points in a worker, keeping their indices."""
+    coords = _WORKER["coords"]
+    rows = [
+        _solve_point(
+            _WORKER["visibility"], coords[int(index)], _WORKER["times"],
+            _WORKER["roll_step"], _WORKER["orbit_time_step"],
+            _WORKER["step_minutes"],
+        )
+        for index in indices
+    ]
+    return indices, rows
+
+
+#: Cap on the automatic worker count.  The solve is memory-bandwidth bound
+#: rather than compute bound — it streams tens of megabytes of orbit-sample
+#: arrays per grid point — so throughput saturates well before the cores do.
+#: Measured on a 16-core machine, 27-day window: 1.7x on 2 workers, 2.7x on
+#: 4, 3.4x on 8, and then flat, 3.5x on 12 and 3.4x on 16.  Past 8 the extra
+#: processes buy a few percent for a proportional slice of RAM, so the
+#: automatic setting stops there.  Pass an explicit number to override.
+_MAX_AUTO_WORKERS = 8
+
+
+def _resolve_workers(n_workers):
+    """Turn the ``n_workers`` setting into a process count (1 = in-process)."""
+    if n_workers is None:
+        n_workers = min(max((os.cpu_count() or 1) - 1, 1), _MAX_AUTO_WORKERS)
+    n_workers = int(n_workers)
+    if n_workers < 1:
+        raise ValueError(
+            f"n_workers must be >= 1, or None to choose automatically; "
+            f"got {n_workers}"
+        )
+    return n_workers
+
+
 def duty_cycle_map(visibility, ra_vals, dec_vals, times,
                    roll_step=2 * u.deg, orbit_time_step=1 * u.min,
-                   progress=True):
+                   progress=True, n_workers=1):
     """
     Duty cycle for every point of a sky grid over one time window.
 
@@ -189,6 +307,11 @@ def duty_cycle_map(visibility, ra_vals, dec_vals, times,
     The orbit grouping and the Sun/Moon ephemeris do not depend on the
     target, so the ``Visibility`` instance caches them after the first
     grid point and every later point reuses them.
+
+    Grid points are independent, so the sweep parallelises cleanly over
+    processes — see *n_workers*.  Threads do not help: the solve is a long
+    run of small numpy operations that hold the GIL, and eight of them
+    measured only 2.2x.
 
     Parameters
     ----------
@@ -205,6 +328,16 @@ def duty_cycle_map(visibility, ra_vals, dec_vals, times,
         Sampling interval inside each orbit for the roll search.
     progress : bool
         Print a progress line with an elapsed/remaining estimate.
+    n_workers : int or None
+        Worker processes to spread the grid over.  1 (the default) solves
+        every point in this process.  None chooses automatically: one per
+        core bar one, capped at ``_MAX_AUTO_WORKERS`` because the solve is
+        memory bound and stops scaling there.  Expect about 4x, not one per
+        core — see that constant for the measured curve.  There is also a
+        fixed cost of roughly ten seconds to warm the caches and start the
+        pool, so a pool pays for itself from a few hundred points up.
+        Results do not depend on this setting: points are solved
+        independently and reassembled by index.
 
     Returns
     -------
@@ -240,6 +373,7 @@ def duty_cycle_map(visibility, ra_vals, dec_vals, times,
     step_minutes = (times[1] - times[0]).to_value(u.min)
     n_ra, n_dec = len(ra_vals), len(dec_vals)
     n_points = n_ra * n_dec
+    n_workers = _resolve_workers(n_workers)
 
     duty = np.zeros((n_dec, n_ra))
     boresight_duty = np.zeros((n_dec, n_ra))
@@ -248,60 +382,78 @@ def duty_cycle_map(visibility, ra_vals, dec_vals, times,
     mean_roll = np.full((n_dec, n_ra), np.nan)
     roll_spread = np.full((n_dec, n_ra), np.nan)
 
-    ra_grid, dec_grid = np.meshgrid(ra_vals, dec_vals)
-    coords = SkyCoord(ra=ra_grid.ravel() * u.deg, dec=dec_grid.ravel() * u.deg,
-                      frame="icrs")
-
     started = _clock.time()
+    # One line per tenth rather than a carriage-returned counter: a saved
+    # notebook keeps every flush as its own output cell, and a redrawn
+    # progress bar turns into a wall of them.
     report_every = max(n_points // 10, 1)
+    next_report = report_every
 
-    for index in range(n_points):
-        result = visibility.get_visibility_best_roll(
-            coords[index], times,
-            roll_step=roll_step, orbit_time_step=orbit_time_step,
-        )
-        visible = np.asarray(result["visible"], dtype=bool)
-        runs = _run_lengths(visible)
-
+    def store(index, values):
         row, column = divmod(index, n_ra)
-        duty[row, column] = 100.0 * visible.mean()
-        boresight_duty[row, column] = 100.0 * np.asarray(
-            result["boresight_visible"], dtype=bool
-        ).mean()
-        longest_window[row, column] = (
-            runs.max() * step_minutes if runs.size else 0.0
+        (duty[row, column], boresight_duty[row, column],
+         longest_window[row, column], n_windows[row, column],
+         mean_roll[row, column], roll_spread[row, column]) = values
+
+    def report(done):
+        nonlocal next_report
+        if not progress:
+            return
+        if done < next_report and done != n_points:
+            return
+        next_report = done + report_every
+        elapsed = _clock.time() - started
+        remaining = elapsed * (n_points - done) / done
+        print(f"  {done:>6} / {n_points} grid points "
+              f"({100 * done / n_points:5.1f}%) — "
+              f"{_format_duration(elapsed)} elapsed, "
+              f"~{_format_duration(remaining)} left")
+
+    # A pool is only worth spawning when there is more than a point each.
+    if n_workers == 1 or n_points <= n_workers:
+        coords = _grid_coords(ra_vals, dec_vals)
+        for index in range(n_points):
+            store(index, _solve_point(
+                visibility, coords[index], times, roll_step,
+                orbit_time_step, step_minutes,
+            ))
+            report(index + 1)
+    else:
+        # Solve the first point here.  That fills the target-independent
+        # ephemeris and orbit-grid caches, and because both are keyed on the
+        # identity of *times* — which the initargs tuple pickles alongside
+        # the instance, preserving that identity — every worker starts warm
+        # instead of spending seconds rebuilding them n_workers times over.
+        coords = _grid_coords(ra_vals, dec_vals)
+        store(0, _solve_point(visibility, coords[0], times, roll_step,
+                              orbit_time_step, step_minutes))
+
+        # Many small chunks rather than one block per worker: the cost of a
+        # grid point varies several-fold across the sky, so a static split
+        # would leave workers idle waiting for whoever drew the slow region.
+        # The per-process caches survive between chunks, so the extra chunks
+        # cost nothing but a little pickling of the index array.
+        chunks = np.array_split(
+            np.arange(1, n_points),
+            min(n_points - 1, n_workers * 8),
         )
-        n_windows[row, column] = runs.size
-
-        # The roll angle is circular, so it is averaged as a unit vector:
-        # the arithmetic mean of -179 and +179 deg would be 0, which is
-        # the opposite attitude.  The resultant's length also gives the
-        # spread for free.
-        roll_deg = np.asarray(result["roll_deg"], dtype=float)
-        chosen = roll_deg[np.isfinite(roll_deg)]
-        if chosen.size:
-            resultant = np.exp(1j * np.deg2rad(chosen)).mean()
-            mean_roll[row, column] = np.rad2deg(np.angle(resultant))
-            # Identical angles give a resultant length of 1 give or take
-            # rounding, and 1 + 1e-16 would send the log positive and the
-            # sqrt to NaN.  Clip both ends before taking either.
-            length = float(np.clip(abs(resultant), 1e-12, 1.0))
-            roll_spread[row, column] = np.rad2deg(
-                np.sqrt(-2.0 * np.log(length))
-            )
-
-        # One line per tenth rather than a carriage-returned counter: a
-        # saved notebook keeps every flush as its own output cell, and
-        # a redrawn progress bar turns into a wall of them.
-        if progress and (index == n_points - 1
-                         or (index and index % report_every == 0)):
-            done = index + 1
-            elapsed = _clock.time() - started
-            remaining = elapsed * (n_points - done) / done
-            print(f"  {done:>6} / {n_points} grid points "
-                  f"({100 * done / n_points:5.1f}%) — "
-                  f"{_format_duration(elapsed)} elapsed, "
-                  f"~{_format_duration(remaining)} left")
+        if progress:
+            print(f"  {n_points} grid points over {n_workers} worker "
+                  f"processes, {len(chunks)} chunks")
+        done = 1
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_worker_init,
+            initargs=(visibility, ra_vals, dec_vals, times, roll_step,
+                      orbit_time_step, step_minutes),
+        ) as pool:
+            futures = [pool.submit(_worker_chunk, chunk) for chunk in chunks]
+            for future in as_completed(futures):
+                indices, rows = future.result()
+                for index, values in zip(indices, rows):
+                    store(int(index), values)
+                done += len(indices)
+                report(done)
 
     return {
         "ra_vals": ra_vals,
