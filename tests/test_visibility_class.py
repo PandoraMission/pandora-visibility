@@ -531,6 +531,119 @@ class TestStarTrackerConstraints:
     def test_time(self):
         return Time("2025-01-01T00:00:00")
 
+    @pytest.fixture
+    def breakdown_vis(self, line1, line2):
+        return Visibility(
+            line1, line2,
+            st_sun_min=50 * u.deg,
+            st_moon_min=20 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_required=1,
+        )
+
+    def test_breakdown_combined_matches_constraint(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """combined reproduces get_star_tracker_constraint exactly."""
+        times = test_time + np.arange(300) * u.min
+        breakdown = breakdown_vis.get_star_tracker_breakdown(target_coord, times)
+        engine = np.asarray(
+            breakdown_vis.get_star_tracker_constraint(target_coord, times)
+        )
+        assert np.array_equal(
+            np.asarray(breakdown["passed"]["combined"]), engine
+        )
+
+    def test_breakdown_rows_reconstruct_tracker(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """ANDing one tracker's per-check rows gives that tracker's verdict."""
+        times = test_time + np.arange(300) * u.min
+        breakdown = breakdown_vis.get_star_tracker_breakdown(target_coord, times)
+        for tracker in (1, 2):
+            rows = [
+                mask for name, mask in breakdown["passed"].items()
+                if name.startswith(f"ST{tracker} ")
+            ]
+            assert rows, f"no per-check rows for ST{tracker}"
+            recon = np.ones(len(times), dtype=bool)
+            for mask in rows:
+                recon &= np.asarray(mask)
+            assert np.array_equal(
+                recon, np.asarray(breakdown["passed"][f"ST{tracker}"])
+            )
+
+    def test_breakdown_only_lists_active_checks(self, line1, line2, target_coord,
+                                                test_time):
+        """Switched-off keep-outs get no row; per-tracker limits are honoured."""
+        vis = Visibility(
+            line1, line2,
+            st_sun_min=44 * u.deg,
+            st1_earthlimb_min=30 * u.deg,
+            st_required=1,
+        )
+        breakdown = vis.get_star_tracker_breakdown(target_coord, test_time)
+        rows = set(breakdown["passed"])
+        assert "ST1 sun" in rows and "ST2 sun" in rows
+        assert "ST1 limb" in rows          # per-tracker override is active
+        assert "ST2 limb" not in rows      # falls back to st_earthlimb_min = 0
+        assert not any(r.endswith(" moon") for r in rows)
+        assert breakdown["limits"]["ST1 limb"] == 30 * u.deg
+
+    def test_breakdown_separations_drive_the_masks(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """Each row's mask is exactly its separation against its limit."""
+        times = test_time + np.arange(200) * u.min
+        breakdown = breakdown_vis.get_star_tracker_breakdown(target_coord, times)
+        for name, mask in breakdown["passed"].items():
+            if name in ("ST1", "ST2", "combined"):
+                continue
+            sep = np.asarray(breakdown["separations"][name], dtype=float)
+            limit = breakdown["limits"][name].to(u.deg).value
+            assert np.array_equal(np.asarray(mask), sep >= limit)
+
+    def test_breakdown_scalar_time_returns_bools(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """Scalar time gives plain bools, matching the array path."""
+        times = test_time + np.arange(5) * u.min
+        scalar = breakdown_vis.get_star_tracker_breakdown(target_coord, times[0])
+        array = breakdown_vis.get_star_tracker_breakdown(target_coord, times)
+        for name, value in scalar["passed"].items():
+            assert isinstance(value, bool), f"{name} is {type(value).__name__}"
+            assert value == bool(np.asarray(array["passed"][name])[0])
+
+    def test_breakdown_roll_override_flows_through(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """A roll override changes the rows and the combined verdict together."""
+        times = test_time + np.arange(200) * u.min
+        at_0 = breakdown_vis.get_star_tracker_breakdown(
+            target_coord, times, roll=0 * u.deg)
+        at_90 = breakdown_vis.get_star_tracker_breakdown(
+            target_coord, times, roll=90 * u.deg)
+        assert not np.array_equal(
+            np.asarray(at_0["passed"]["combined"]),
+            np.asarray(at_90["passed"]["combined"]),
+        )
+        # and each stays internally consistent
+        for breakdown in (at_0, at_90):
+            recon = np.ones(len(times), dtype=bool)
+            for name, mask in breakdown["passed"].items():
+                if name.startswith("ST1 "):
+                    recon &= np.asarray(mask)
+            assert np.array_equal(recon, np.asarray(breakdown["passed"]["ST1"]))
+
+    def test_breakdown_requires_angle_quantity_for_roll(
+        self, breakdown_vis, target_coord, test_time
+    ):
+        """A bare number for roll is rejected, as elsewhere in the API."""
+        with pytest.raises(TypeError, match="roll"):
+            breakdown_vis.get_star_tracker_breakdown(
+                target_coord, test_time, roll=45
+            )
+
     def test_st_defaults_are_zero(self, line1, line2):
         """Star tracker constraints default to 0 (disabled)."""
         vis = Visibility(line1, line2)
@@ -1440,6 +1553,70 @@ class TestEarthlimbDayNight:
         summary = vis.summary(target_coord, test_time)
         assert "[day]" in summary or "[night]" in summary
 
+    @pytest.mark.parametrize("mode", ["subsatellite", "limb"])
+    def test_summary_threshold_matches_engine(self, line1, line2, mode):
+        """The req: value summary prints is the one get_visibility applied.
+
+        summary() used to derive day/night from the nearest limb point
+        regardless of daynight_mode, so in the default "subsatellite" mode
+        it could report the night limit while the engine applied the day
+        limit (or vice versa).
+        """
+        day_min, night_min = 40 * u.deg, 5 * u.deg
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=day_min,
+            earthlimb_night_min=night_min,
+            daynight_mode=mode,
+        )
+        target = SkyCoord(ra=90, dec=-30, unit="deg")
+
+        checked = 0
+        for i in range(0, 200, 5):
+            time = Time("2026-02-15T18:00:00") + i * u.min
+            pre = vis._precompute(time)
+            tgt_u = vis._target_unit(target, time)
+            engine_deg = float(vis._effective_earthlimb_min_deg(
+                tgt_u, pre["zenith_unit"], pre["body_units"]["sun"],
+                limb_angle_rad=pre["limb_angle_rad"],
+            ))
+            expected_side = "day" if engine_deg == day_min.value else "night"
+
+            line = next(
+                ln for ln in vis.summary(target, time).split("\n")
+                if ln.startswith("Earthlimb")
+            )
+            assert f"[{expected_side}]" in line, (
+                f"{mode} mode at {time.iso}: engine used {engine_deg} deg "
+                f"but summary reported: {line.strip()}"
+            )
+            assert f"{engine_deg:>6.1f} deg" in line, (
+                f"{mode} mode at {time.iso}: engine used {engine_deg} deg "
+                f"but summary reported: {line.strip()}"
+            )
+            checked += 1
+
+        assert checked == 40
+
+    def test_daynight_is_sunlit_follows_mode(self, line1, line2):
+        """_daynight_is_sunlit dispatches on daynight_mode.
+
+        Geometry chosen so the two modes disagree: the spacecraft is over
+        sunlit ground, but the limb point toward the target is dark.
+        """
+        target = np.array([-1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        sun = np.array([0.995, 0.0, 0.0999])  # low sun, 84 deg off zenith
+        limb_rad = np.deg2rad(21.0)
+
+        vis_sub = Visibility(line1, line2, daynight_mode="subsatellite")
+        vis_limb = Visibility(line1, line2, daynight_mode="limb")
+
+        assert bool(vis_sub._daynight_is_sunlit(
+            target, zenith, sun, limb_angle_rad=limb_rad)) is True
+        assert bool(vis_limb._daynight_is_sunlit(
+            target, zenith, sun, limb_angle_rad=limb_rad)) is False
+
     # ── Fallback behavior ───────────────────────────────────────────
 
     def test_only_day_set_falls_back_to_earthlimb_min(self, line1, line2):
@@ -1466,13 +1643,29 @@ class TestEarthlimbDayNight:
         )
         assert vis.earthlimb_night_min == 5 * u.deg
         assert vis.earthlimb_day_min is None
-        # Day threshold should use earthlimb_min
-        # Sun aligned with zenith so subsatellite point is sunlit (day)
+
+    @pytest.mark.parametrize("mode,sun_lit", [
+        # Sun along the zenith: the ground below the spacecraft is sunlit.
+        ("subsatellite", np.array([0.0, 0.0, 1.0])),
+        # Sun along the target's horizontal direction: the limb the
+        # boresight grazes is sunlit.
+        ("limb", np.array([1.0, 0.0, 0.0])),
+    ])
+    def test_day_falls_back_to_earthlimb_min(self, line1, line2, mode, sun_lit):
+        """With only night set, the day threshold uses earthlimb_min.
+
+        Checked in both day/night modes with a geometry that reads as day
+        for that mode, so the fallback is covered whichever is default.
+        """
+        vis = Visibility(
+            line1, line2,
+            earthlimb_night_min=5 * u.deg,
+            daynight_mode=mode,
+        )
         target = np.array([1.0, 0.0, 0.0])
         zenith = np.array([0.0, 0.0, 1.0])
-        sun_lit = np.array([0.0, 0.0, 1.0])
         eff = vis._effective_earthlimb_min_deg(target, zenith, sun_lit)
-        assert float(eff) == pytest.approx(20.0)
+        assert float(eff) == pytest.approx(20.0)  # earthlimb_min default
 
     # ── Array time ──────────────────────────────────────────────────
 
@@ -1608,10 +1801,17 @@ class TestEarthlimbDayNight:
 
     # ── daynight_mode / subsatellite ────────────────────────────────
 
-    def test_daynight_mode_default_is_subsatellite(self, line1, line2):
-        """Default daynight_mode is 'subsatellite'."""
+    def test_daynight_mode_default_is_limb(self, line1, line2):
+        """Default daynight_mode is 'limb'.
+
+        The day/night split exists to model stray light from the sunlit
+        Earth, which comes from the patch the boresight grazes — so the
+        default matches the dynamic DPC wedge rather than the orbit-only
+        subsatellite test.
+        """
         vis = Visibility(line1, line2)
-        assert vis.daynight_mode == "subsatellite"
+        assert vis.daynight_mode == "limb"
+        assert Visibility.DAYNIGHT_MODE == "limb"
 
     def test_daynight_mode_subsatellite_stored(self, line1, line2):
         """Custom daynight_mode='subsatellite' is stored."""
@@ -1707,19 +1907,8 @@ class TestEarthlimbDayNight:
             "day/night thresholds for at least some timesteps"
         )
 
-    def test_subsatellite_mode_repr(self, line1, line2):
-        """repr omits daynight when mode is default 'subsatellite'."""
-        vis = Visibility(
-            line1, line2,
-            earthlimb_day_min=25 * u.deg,
-            earthlimb_night_min=10 * u.deg,
-            daynight_mode="subsatellite",
-        )
-        r = repr(vis)
-        assert "daynight=" not in r
-
-    def test_limb_mode_repr_shows_daynight(self, line1, line2):
-        """repr shows daynight=limb when mode is non-default."""
+    def test_limb_mode_repr_omits_daynight(self, line1, line2):
+        """repr omits daynight when mode is the default 'limb'."""
         vis = Visibility(
             line1, line2,
             earthlimb_day_min=25 * u.deg,
@@ -1727,7 +1916,18 @@ class TestEarthlimbDayNight:
             daynight_mode="limb",
         )
         r = repr(vis)
-        assert "daynight=limb" in r
+        assert "daynight=" not in r
+
+    def test_subsatellite_mode_repr_shows_daynight(self, line1, line2):
+        """repr shows daynight=subsatellite when mode is non-default."""
+        vis = Visibility(
+            line1, line2,
+            earthlimb_day_min=25 * u.deg,
+            earthlimb_night_min=10 * u.deg,
+            daynight_mode="subsatellite",
+        )
+        r = repr(vis)
+        assert "daynight=subsatellite" in r
 
     def test_subsatellite_no_effect_without_day_night(self, line1, line2, target_coord):
         """When day/night both None, daynight_mode makes no difference."""
@@ -1737,3 +1937,790 @@ class TestEarthlimbDayNight:
         r_limb = vis_limb.get_visibility(target_coord, times)
         r_subsat = vis_subsat.get_visibility(target_coord, times)
         np.testing.assert_array_equal(r_limb, r_subsat)
+
+
+class TestDynamicEarthlimb:
+    """Tests for the use_dynamic_earthlimb (DPC wedge) keep-out."""
+
+    # Keep-out values from the DPC wedge table, referenced to the limb
+    # (i.e. with the 66 deg Earth angular radius already subtracted).
+    BRIGHT = 110.0 - 66.0
+    DARK = 75.0 - 66.0
+
+    @pytest.fixture
+    def line1(self):
+        return "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+
+    @pytest.fixture
+    def line2(self):
+        return "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
+
+    @pytest.fixture
+    def target_coord(self):
+        """WASP-107 — has both sunlit and dark limb crossings in mid-2026."""
+        return SkyCoord(188.386, -10.1462, frame="icrs", unit="deg")
+
+    @pytest.fixture
+    def test_time(self):
+        return Time("2026-06-01T00:00:00")
+
+    # ── Defaults & storage ──────────────────────────────────────────
+
+    def test_default_is_false(self, line1, line2):
+        """use_dynamic_earthlimb defaults to False."""
+        vis = Visibility(line1, line2)
+        assert vis.use_dynamic_earthlimb is False
+
+    def test_stored_when_true(self, line1, line2):
+        """use_dynamic_earthlimb=True is stored on the instance."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        assert vis.use_dynamic_earthlimb is True
+
+    def test_false_matches_omitting_it(self, line1, line2, target_coord, test_time):
+        """Passing use_dynamic_earthlimb=False changes nothing."""
+        times = test_time + np.arange(300) * u.min
+        vis_omit = Visibility(line1, line2)
+        vis_false = Visibility(line1, line2, use_dynamic_earthlimb=False)
+        np.testing.assert_array_equal(
+            vis_omit.get_visibility(target_coord, times),
+            vis_false.get_visibility(target_coord, times),
+        )
+
+    # ── _dynamic_earthlimb_min_deg piecewise fit ────────────────────
+
+    def test_piecewise_flat_segments(self):
+        """Below 78 deg and at/above 90 deg the curve is flat."""
+        for illum in [0.0, 40.0, 77.0, 77.999]:
+            assert Visibility._dynamic_earthlimb_min_deg(illum) == pytest.approx(
+                self.BRIGHT
+            )
+        for illum in [90.0, 120.0, 180.0]:
+            assert Visibility._dynamic_earthlimb_min_deg(illum) == pytest.approx(
+                self.DARK
+            )
+
+    def test_piecewise_anchor_points(self):
+        """The three anchor points are hit exactly (from the Earth centre)."""
+        assert Visibility._dynamic_earthlimb_min_deg(78.0) == pytest.approx(
+            110.0 - 66.0
+        )
+        assert Visibility._dynamic_earthlimb_min_deg(89.0) == pytest.approx(
+            82.0 - 66.0
+        )
+        assert Visibility._dynamic_earthlimb_min_deg(90.0) == pytest.approx(
+            75.0 - 66.0
+        )
+
+    def test_piecewise_rule1(self):
+        """78-89 deg is a straight line from 110 to 82 deg."""
+        m = (82.0 - 110.0) / (89.0 - 78.0)
+        for illum in [78.0, 82.5, 89.0]:
+            assert Visibility._dynamic_earthlimb_min_deg(illum) == pytest.approx(
+                110.0 + m * (illum - 78.0) - 66.0
+            )
+
+    def test_piecewise_rule2(self):
+        """89-90 deg is a steeper straight line from 82 to 75 deg."""
+        m = (75.0 - 82.0) / (90.0 - 89.0)
+        for illum in [89.001, 89.5, 89.999]:
+            assert Visibility._dynamic_earthlimb_min_deg(illum) == pytest.approx(
+                82.0 + m * (illum - 89.0) - 66.0
+            )
+
+    def test_piecewise_continuous(self):
+        """The curve has no steps at the 78, 89 and 90 deg joins."""
+        for knee in [78.0, 89.0, 90.0]:
+            below = Visibility._dynamic_earthlimb_min_deg(knee - 1e-6)
+            at = Visibility._dynamic_earthlimb_min_deg(knee)
+            above = Visibility._dynamic_earthlimb_min_deg(knee + 1e-6)
+            assert below == pytest.approx(at, abs=1e-4)
+            assert above == pytest.approx(at, abs=1e-4)
+
+    def test_piecewise_monotonic_and_bounded(self):
+        """Keep-out falls monotonically from the bright to the dark value."""
+        keepout = Visibility._dynamic_earthlimb_min_deg(
+            np.linspace(0.0, 180.0, 18001)
+        )
+        assert np.all(np.diff(keepout) <= 1e-9)
+        assert keepout.max() == pytest.approx(self.BRIGHT)
+        assert keepout.min() == pytest.approx(self.DARK)
+        assert keepout[0] == pytest.approx(self.BRIGHT)
+        assert keepout[-1] == pytest.approx(self.DARK)
+
+    def test_piecewise_wraps_around(self):
+        """The curve is symmetric: -x, +x and +x+360 give the same keep-out."""
+        for illum in [0.0, 45.0, 78.0, 85.0, 89.5, 90.0, 120.0, 180.0]:
+            base = Visibility._dynamic_earthlimb_min_deg(illum)
+            assert Visibility._dynamic_earthlimb_min_deg(-illum) == pytest.approx(
+                base
+            )
+            assert Visibility._dynamic_earthlimb_min_deg(
+                illum + 360.0
+            ) == pytest.approx(base)
+            assert Visibility._dynamic_earthlimb_min_deg(
+                360.0 - illum
+            ) == pytest.approx(base)
+
+    def test_piecewise_wrap_beyond_180(self):
+        """Angles past 180 deg fold back toward the sub-solar direction."""
+        # 190 deg is 170 deg on the other side → still fully dark
+        assert Visibility._dynamic_earthlimb_min_deg(190.0) == pytest.approx(
+            Visibility._dynamic_earthlimb_min_deg(170.0)
+        )
+        # 282 deg folds to 78 deg → back on the bright ramp
+        assert Visibility._dynamic_earthlimb_min_deg(282.0) == pytest.approx(
+            Visibility._dynamic_earthlimb_min_deg(78.0)
+        )
+
+    def test_piecewise_wraps_array(self):
+        """Wrapping also works element-wise on arrays."""
+        illum = np.array([-85.0, -12.0, 275.0, 400.0])
+        np.testing.assert_allclose(
+            Visibility._dynamic_earthlimb_min_deg(illum),
+            Visibility._dynamic_earthlimb_min_deg(np.array([85.0, 12.0, 85.0, 40.0])),
+        )
+
+    def test_illumination_angle_range(self, line1, line2, target_coord, test_time):
+        """The computed illumination angle always lands in [0, 180]."""
+        times = test_time + np.arange(2 * 1440) * u.min
+        vis = Visibility(line1, line2)
+        pre = vis._precompute(times)
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+        illum = vis._get_earth_illumination_angle(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        assert illum.min() >= 0.0
+        assert illum.max() <= 180.0
+
+    def test_piecewise_array_shape(self):
+        """Array input returns an array of the same shape."""
+        illum = np.array([10.0, 85.0, 89.5, 95.0])
+        keepout = Visibility._dynamic_earthlimb_min_deg(illum)
+        assert keepout.shape == illum.shape
+        assert keepout[0] == pytest.approx(self.BRIGHT)
+        assert keepout[3] == pytest.approx(self.DARK)
+
+    # ── _get_earth_illumination_angle unit tests ────────────────────
+
+    def test_illumination_angle_with_limb_angle(self):
+        """Known geometry: target +X, zenith +Z, normal = cos(la)Z + sin(la)X."""
+        target = np.array([1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        la_rad = np.arccos(0.91)  # typical LEO value
+
+        # Sun overhead: n·sun = cos(la) = 0.91
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([0.0, 0.0, 1.0]), limb_angle_rad=la_rad
+        )) == pytest.approx(np.rad2deg(np.arccos(0.91)))
+
+        # Sun below: n·sun = -cos(la)
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([0.0, 0.0, -1.0]), limb_angle_rad=la_rad
+        )) == pytest.approx(180.0 - np.rad2deg(np.arccos(0.91)))
+
+        # Sun along the limb direction: n·sun = sin(la)
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([1.0, 0.0, 0.0]), limb_angle_rad=la_rad
+        )) == pytest.approx(np.rad2deg(np.arccos(np.sin(la_rad))))
+
+    def test_illumination_angle_legacy_fallback(self):
+        """Without limb_angle_rad the horizontal projection is used."""
+        target = np.array([1.0, 0.0, 0.0])
+        zenith = np.array([0.0, 0.0, 1.0])
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([1.0, 0.0, 0.0])
+        )) == pytest.approx(0.0, abs=1e-6)
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([-1.0, 0.0, 0.0])
+        )) == pytest.approx(180.0)
+        assert float(Visibility._get_earth_illumination_angle(
+            target, zenith, np.array([0.0, 0.0, 1.0])
+        )) == pytest.approx(90.0)
+
+    def test_illumination_angle_array(self):
+        """Array inputs give one illumination angle per timestep."""
+        target = np.array([[1.0, 1.0], [0.0, 0.0], [0.0, 0.0]])
+        zenith = np.array([[0.0, 0.0], [0.0, 0.0], [1.0, 1.0]])
+        sun = np.array([[1.0, -1.0], [0.0, 0.0], [0.0, 0.0]])
+        angles = Visibility._get_earth_illumination_angle(target, zenith, sun)
+        assert angles.shape == (2,)
+        assert angles[0] == pytest.approx(0.0, abs=1e-6)
+        assert angles[1] == pytest.approx(180.0)
+
+    def test_illumination_angle_agrees_with_is_sunlit(self, line1, line2,
+                                                      target_coord, test_time):
+        """< 90 deg illumination is exactly the sunlit condition."""
+        times = test_time + np.arange(2 * 1440) * u.min
+        vis = Visibility(line1, line2)
+        pre = vis._precompute(times)
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+
+        illum = vis._get_earth_illumination_angle(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        sunlit = vis._earthlimb_is_sunlit(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        # Both are day and night in this window, so this is a real test
+        assert sunlit.any() and not sunlit.all()
+        np.testing.assert_array_equal(illum < 90.0, sunlit)
+
+    # ── Effective threshold ─────────────────────────────────────────
+
+    def test_effective_threshold_uses_dynamic_curve(self, line1, line2,
+                                                    target_coord, test_time):
+        """The effective threshold is the wedge curve of the illumination angle."""
+        times = test_time + np.arange(1440) * u.min
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        pre = vis._precompute(times)
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+
+        thresh = vis._effective_earthlimb_min_deg(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        illum = vis._get_earth_illumination_angle(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        np.testing.assert_allclose(
+            thresh, Visibility._dynamic_earthlimb_min_deg(illum)
+        )
+        # Over a full day the threshold varies and stays inside the curve
+        curve = Visibility._dynamic_earthlimb_min_deg(
+            np.linspace(0.0, 180.0, 18001)
+        )
+        assert thresh.min() >= curve.min()
+        assert thresh.max() <= curve.max()
+        assert thresh.max() - thresh.min() > 1.0
+        # The dark plateau is reached on the night side of every orbit
+        assert np.isclose(thresh, self.DARK).any()
+
+    def test_dynamic_overrides_day_night(self, line1, line2, target_coord,
+                                         test_time):
+        """use_dynamic_earthlimb takes precedence over the day/night pair."""
+        times = test_time + np.arange(500) * u.min
+        vis_dyn = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        vis_both = Visibility(
+            line1, line2,
+            use_dynamic_earthlimb=True,
+            earthlimb_day_min=90 * u.deg,
+            earthlimb_night_min=0 * u.deg,
+        )
+        np.testing.assert_array_equal(
+            vis_dyn.get_visibility(target_coord, times),
+            vis_both.get_visibility(target_coord, times),
+        )
+
+    # ── Integration with get_visibility ─────────────────────────────
+
+    def test_dynamic_bracketed_by_fixed_limits(self, line1, line2, target_coord,
+                                               test_time):
+        """Dynamic visibility sits between the flat bright and dark limits."""
+        times = test_time + np.arange(3 * 1440) * u.min
+        vis_dyn = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        vis_loose = Visibility(line1, line2, earthlimb_min=self.DARK * u.deg)
+        vis_tight = Visibility(line1, line2, earthlimb_min=self.BRIGHT * u.deg)
+
+        r_dyn = vis_dyn.get_visibility(target_coord, times)
+        r_loose = vis_loose.get_visibility(target_coord, times)
+        r_tight = vis_tight.get_visibility(target_coord, times)
+
+        assert np.all(r_dyn <= r_loose)
+        assert np.all(r_tight <= r_dyn)
+        # The dynamic curve is not degenerate to either bound
+        assert r_dyn.sum() < r_loose.sum()
+        assert r_dyn.sum() > r_tight.sum()
+
+    def test_dynamic_differs_from_default(self, line1, line2, target_coord,
+                                          test_time):
+        """The dynamic curve changes visibility versus the fixed 20 deg limit."""
+        times = test_time + np.arange(3 * 1440) * u.min
+        r_default = Visibility(line1, line2).get_visibility(target_coord, times)
+        r_dyn = Visibility(
+            line1, line2, use_dynamic_earthlimb=True
+        ).get_visibility(target_coord, times)
+        assert not np.array_equal(r_default, r_dyn)
+
+    def test_get_constraint_matches_manual_threshold(self, line1, line2,
+                                                     target_coord, test_time):
+        """get_constraint('earthlimb') applies the same dynamic threshold."""
+        times = test_time + np.arange(400) * u.min
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        pre = vis._precompute(times)
+        tgt_gcrs = target_coord.transform_to(GCRS(obstime=times))
+        tgt_xyz = tgt_gcrs.cartesian.xyz.value
+        tgt_b = tgt_xyz / np.linalg.norm(tgt_xyz, axis=0, keepdims=True)
+
+        illum = vis._get_earth_illumination_angle(
+            tgt_b, pre["zenith_unit"], pre["body_units"]["sun"],
+            limb_angle_rad=pre["limb_angle_rad"],
+        )
+        actual = vis.get_separations(target_coord, times)["earthlimb"]
+        expected = (
+            actual.to(u.deg).value
+            >= Visibility._dynamic_earthlimb_min_deg(illum)
+        )
+        np.testing.assert_array_equal(
+            vis.get_constraint(target_coord, "earthlimb", times), expected
+        )
+
+    def test_get_constraint_scalar_time(self, line1, line2, target_coord,
+                                        test_time):
+        """Scalar times work through the get_constraint path."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        result = vis.get_constraint(target_coord, "earthlimb", test_time)
+        assert bool(result) in (True, False)
+
+    def test_best_roll_uses_dynamic(self, line1, line2, target_coord, test_time):
+        """The best-roll fast path applies the dynamic threshold too."""
+        times = test_time + np.arange(97) * u.min
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        result = vis.get_visibility_best_roll(target_coord, times)
+        np.testing.assert_array_equal(
+            result["boresight_visible"], vis.get_visibility(target_coord, times)
+        )
+
+    # ── repr / summary ──────────────────────────────────────────────
+
+    def test_repr_shows_dynamic(self, line1, line2):
+        """repr flags the dynamic limb keep-out."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        r = repr(vis)
+        assert "limb=dynamic" in r
+        assert "limb_day" not in r
+
+    def test_summary_shows_illumination(self, line1, line2, target_coord,
+                                        test_time):
+        """summary() reports the illumination angle driving the threshold."""
+        vis = Visibility(line1, line2, use_dynamic_earthlimb=True)
+        text = vis.summary(target_coord, test_time)
+        assert "illum" in text
+        assert "Earthlimb" in text
+
+
+class TestEphemerisStepAndCaching:
+    """Tests for ephemeris_step interpolation and the precompute caches."""
+
+    @pytest.fixture
+    def line1(self):
+        return "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+
+    @pytest.fixture
+    def line2(self):
+        return "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
+
+    @pytest.fixture
+    def kwargs(self):
+        return dict(
+            earthlimb_day_min=44 * u.deg,
+            earthlimb_night_min=13 * u.deg,
+            st_sun_min=50 * u.deg,
+            st_moon_min=20 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_required=1,
+        )
+
+    @pytest.fixture
+    def targets(self):
+        return [
+            SkyCoord(188.386, -10.1462, frame="icrs", unit="deg"),
+            SkyCoord(79.17, 45.99, frame="icrs", unit="deg"),
+        ]
+
+    @pytest.fixture
+    def times(self):
+        return Time("2026-06-01T00:00:00") + np.arange(600) * u.min
+
+    # ── ephemeris_step ──────────────────────────────────────────────
+
+    def test_default_is_none(self, line1, line2):
+        """ephemeris_step defaults to None, i.e. an exact ephemeris."""
+        assert Visibility(line1, line2).ephemeris_step is None
+
+    def test_stored(self, line1, line2):
+        """A custom ephemeris_step is stored on the instance."""
+        vis = Visibility(line1, line2, ephemeris_step=30 * u.min)
+        assert vis.ephemeris_step == 30 * u.min
+
+    def test_requires_time_units(self, line1, line2):
+        """A bare number, or an angle, is rejected."""
+        with pytest.raises(TypeError, match="astropy Quantity"):
+            Visibility(line1, line2, ephemeris_step=30)
+        with pytest.raises(u.UnitsError, match="time units"):
+            Visibility(line1, line2, ephemeris_step=30 * u.deg)
+
+    def test_interpolated_bodies_match_exact(self, line1, line2, times):
+        """Interpolated body directions agree with the exact ephemeris."""
+        exact = Visibility(line1, line2)._precompute(times)
+        interp = Visibility(
+            line1, line2, ephemeris_step=60 * u.min
+        )._precompute(times)
+
+        for name in ("sun", "moon"):
+            dot = np.sum(exact["body_units"][name] * interp["body_units"][name],
+                         axis=0)
+            offset = np.rad2deg(np.arccos(np.clip(dot, -1.0, 1.0)))
+            # Tens of degrees of keep-out; this must be far below that
+            assert offset.max() < 0.01, f"{name} off by {offset.max()} deg"
+
+        # The satellite-dependent quantities are untouched by interpolation
+        np.testing.assert_array_equal(exact["zenith_unit"],
+                                      interp["zenith_unit"])
+        np.testing.assert_array_equal(exact["limb_angle_rad"],
+                                      interp["limb_angle_rad"])
+
+    def test_interpolation_does_not_change_visibility(self, line1, line2,
+                                                      kwargs, targets, times):
+        """get_visibility is unchanged by the interpolated ephemeris."""
+        exact = Visibility(line1, line2, **kwargs)
+        interp = Visibility(line1, line2, ephemeris_step=60 * u.min, **kwargs)
+        for target in targets:
+            np.testing.assert_array_equal(
+                exact.get_visibility(target, times),
+                interp.get_visibility(target, times),
+            )
+
+    def test_interpolation_does_not_change_best_roll(self, line1, line2,
+                                                     kwargs, targets, times):
+        """The best-roll decisions are unchanged by the interpolated ephemeris."""
+        exact = Visibility(line1, line2, **kwargs)
+        interp = Visibility(line1, line2, ephemeris_step=60 * u.min, **kwargs)
+        for target in targets:
+            a = exact.get_visibility_best_roll(target, times)
+            b = interp.get_visibility_best_roll(target, times)
+            for key in ("visible", "boresight_visible", "n_st_pass"):
+                np.testing.assert_array_equal(np.asarray(a[key]),
+                                              np.asarray(b[key]))
+            np.testing.assert_array_equal(np.isnan(a["roll_deg"]),
+                                          np.isnan(b["roll_deg"]))
+            good = ~np.isnan(a["roll_deg"])
+            np.testing.assert_array_equal(a["roll_deg"][good],
+                                          b["roll_deg"][good])
+
+    def test_scalar_time_ignores_interpolation(self, line1, line2, kwargs,
+                                               targets):
+        """A scalar time is always evaluated exactly."""
+        moment = Time("2026-06-01T03:00:00")
+        exact = Visibility(line1, line2, **kwargs)
+        interp = Visibility(line1, line2, ephemeris_step=60 * u.min, **kwargs)
+        assert (exact.get_visibility(targets[0], moment)
+                == interp.get_visibility(targets[0], moment))
+
+    # ── precompute cache ────────────────────────────────────────────
+
+    def test_precompute_cache_hits_same_object(self, line1, line2, times):
+        """The same Time object is served from the cache."""
+        vis = Visibility(line1, line2)
+        first = vis._precompute(times)
+        assert vis._precompute(times) is first
+
+    def test_precompute_cache_misses_other_times(self, line1, line2, times):
+        """A different grid must never be served the cached entry.
+
+        The cache used to key on ``id(time)``, which CPython recycles once
+        the original is collected, so a later grid could land on a dead
+        entry's address and be served its data.
+        """
+        vis = Visibility(line1, line2)
+        first = vis._precompute(times)
+        zenith_first = first["zenith_unit"].copy()
+
+        # Drop the reference and build a new grid, which may well land on
+        # the freed address.
+        other = Time("2026-07-15T00:00:00") + np.arange(600) * u.min
+        second = vis._precompute(other)
+        assert second is not first
+        assert not np.allclose(second["zenith_unit"], zenith_first)
+
+        # Recomputing the original grid still gives the original answer
+        again = Visibility(line1, line2)._precompute(times)
+        np.testing.assert_allclose(again["zenith_unit"], zenith_first)
+
+    def test_orbit_grid_shared_between_targets(self, line1, line2, kwargs,
+                                               targets, times):
+        """The orbit sampling grid is built once and reused per target."""
+        vis = Visibility(line1, line2, **kwargs)
+        vis.get_visibility_best_roll(targets[0], times)
+        grid = vis._orbit_grid_cache_value
+        assert grid is not None
+
+        vis.get_visibility_best_roll(targets[1], times)
+        assert vis._orbit_grid_cache_value is grid, (
+            "the second target rebuilt the target-independent orbit grid"
+        )
+
+    def test_orbit_grid_rebuilt_for_new_times(self, line1, line2, kwargs,
+                                              targets, times):
+        """A different time grid or orbit step invalidates the cache."""
+        vis = Visibility(line1, line2, **kwargs)
+        vis.get_visibility_best_roll(targets[0], times)
+        grid = vis._orbit_grid_cache_value
+
+        vis.get_visibility_best_roll(targets[0], times[:200])
+        assert vis._orbit_grid_cache_value is not grid
+
+        grid = vis._orbit_grid_cache_value
+        vis.get_visibility_best_roll(targets[0], times[:200],
+                                     orbit_time_step=5 * u.min)
+        assert vis._orbit_grid_cache_value is not grid
+
+    def test_orbit_grid_layout(self, line1, line2, kwargs, times):
+        """Orbit windows are laid out contiguously, one block per orbit."""
+        vis = Visibility(line1, line2, **kwargs)
+        grid = vis._orbit_sampling_grid(times, 1 * u.min)
+        n_orbits = len(grid["orbit_ids"])
+        n_samp = grid["n_orbit_samp"]
+
+        assert grid["pre_orbit_all"]["zenith_unit"].shape == (3, n_orbits * n_samp)
+        assert grid["pre_input_all"]["zenith_unit"].shape == (3, len(times))
+        assert len(grid["chunk_indices"]) == n_orbits
+        # every input timestep belongs to exactly one orbit
+        covered = np.concatenate(grid["chunk_indices"])
+        np.testing.assert_array_equal(np.sort(covered), np.arange(len(times)))
+
+    # ── vectorised roll attitude ────────────────────────────────────
+
+    def test_roll_attitude_batch_matches_scalar(self):
+        """_roll_attitude_batch reproduces _roll_attitude for every angle."""
+        z_unit = np.array([0.3, -0.5, 0.81])
+        z_unit = z_unit / np.linalg.norm(z_unit)
+        rolls = np.deg2rad(np.arange(0, 360, 2.0))
+
+        x_all, y_all = Visibility._roll_attitude_batch(z_unit, rolls)
+        assert x_all.shape == (len(rolls), 3)
+        for i, roll in enumerate(rolls):
+            x_one, y_one = Visibility._roll_attitude(z_unit, roll)
+            np.testing.assert_allclose(x_all[i], x_one, atol=1e-14)
+            np.testing.assert_allclose(y_all[i], y_one, atol=1e-14)
+
+    def test_roll_attitude_batch_near_pole(self):
+        """The celestial-pole fallback is applied in the batch version too."""
+        z_unit = np.array([0.0, 0.0, 1.0])
+        rolls = np.deg2rad(np.array([0.0, 90.0, 180.0]))
+        x_all, y_all = Visibility._roll_attitude_batch(z_unit, rolls)
+        for i, roll in enumerate(rolls):
+            x_one, y_one = Visibility._roll_attitude(z_unit, roll)
+            np.testing.assert_allclose(x_all[i], x_one, atol=1e-14)
+            np.testing.assert_allclose(y_all[i], y_one, atol=1e-14)
+
+
+class TestConstraintApiConsistency:
+    """The diagnostic API must agree with get_visibility, body for body."""
+
+    LINE1 = "1 67395U 80229J   26212.76861111  .00000000  00000-0  37770-3 0    05"
+    LINE2 = "2 67395  97.8073 210.7389 0004787   3.5990  91.5851 14.88172851    02"
+
+    @pytest.fixture
+    def vis(self):
+        return Visibility(
+            self.LINE1, self.LINE2,
+            earthlimb_day_min=44 * u.deg,
+            earthlimb_night_min=13 * u.deg,
+            sun_min=91 * u.deg,
+            moon_min=20 * u.deg,
+            st_sun_min=50 * u.deg,
+            st_moon_min=20 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_required=1,
+        )
+
+    @pytest.fixture
+    def times(self):
+        return Time("2026-08-10T00:00:00") + np.arange(500) * u.min
+
+    @pytest.fixture
+    def target_coord(self):
+        return SkyCoord(330.795, 18.884, frame="icrs", unit="deg")
+
+    def test_every_invisible_step_is_explained(self, vis, target_coord, times):
+        """No step may be invisible without some constraint failing.
+
+        The two used to disagree because the diagnostics went through the
+        astropy path while get_visibility used the vector path.
+        """
+        visible = np.asarray(vis.get_visibility(target_coord, times))
+        constraints = vis.get_all_constraints(target_coord, times)
+
+        failing = np.zeros(len(times), dtype=bool)
+        for passed in constraints.values():
+            failing |= ~np.asarray(passed)
+
+        assert not np.any(~visible & ~failing), (
+            f"{int(np.sum(~visible & ~failing))} invisible steps that no "
+            f"individual constraint explains"
+        )
+
+    def test_all_constraints_passing_means_visible(self, vis, target_coord,
+                                                   times):
+        """The converse: if every constraint passes the target is visible."""
+        visible = np.asarray(vis.get_visibility(target_coord, times))
+        constraints = vis.get_all_constraints(target_coord, times)
+
+        all_pass = np.ones(len(times), dtype=bool)
+        for passed in constraints.values():
+            all_pass &= np.asarray(passed)
+
+        np.testing.assert_array_equal(all_pass & ~visible,
+                                      np.zeros(len(times), dtype=bool))
+
+    def test_star_tracker_constraint_matches_visibility(self, vis, target_coord,
+                                                        times):
+        """The ST diagnostic uses the same path as get_visibility."""
+        pre = vis._precompute(times)
+        target_unit = vis._target_unit(target_coord, times)[:, 0].copy()
+        np.testing.assert_array_equal(
+            np.asarray(vis.get_star_tracker_constraint(target_coord, times)),
+            np.asarray(vis._get_st_constraint_fast(target_unit, times, pre)),
+        )
+
+    def test_earthlimb_separation_matches_visibility_math(self, vis,
+                                                          target_coord, times):
+        """The reported limb angle is the one the constraint is applied to.
+
+        Both are geocentric now; get_separations used to return an AltAz
+        altitude, which is referenced to the geodetic horizon and so
+        differed from the constraint by up to 0.1 deg.
+        """
+        pre = vis._precompute(times)
+        target_unit = vis._target_unit(target_coord, times)
+        expected = vis._fast_limb_deg(
+            target_unit, pre["zenith_unit"], pre["limb_angle_rad"]
+        )
+        separations = vis.get_separations(target_coord, times)
+        np.testing.assert_allclose(
+            separations["earthlimb"].to(u.deg).value, expected
+        )
+
+    def test_separations_agree_with_constraints(self, vis, target_coord, times):
+        """A body constraint passes exactly when its separation clears the limit."""
+        separations = vis.get_separations(target_coord, times)
+        for body, limit in (("moon", vis.moon_min), ("sun", vis.sun_min)):
+            np.testing.assert_array_equal(
+                np.asarray(vis.get_constraint(target_coord, body, times)),
+                separations[body] >= limit,
+            )
+
+    # ── precompute reuse ────────────────────────────────────────────
+
+    def test_all_constraints_precomputes_once(self, vis, target_coord, times,
+                                              monkeypatch):
+        """One set of ephemeris/SGP4 results covers every body."""
+        calls = []
+        original = Visibility._precompute
+
+        def counted(self, time):
+            calls.append(time)
+            return original(self, time)
+
+        monkeypatch.setattr(Visibility, "_precompute", counted)
+        vis.get_all_constraints(target_coord, times)
+        assert len(calls) == 1, f"_precompute called {len(calls)} times"
+
+    def test_constraint_accepts_precomputed_data(self, vis, target_coord, times):
+        """Passing `pre` gives the same answer as letting it compute one."""
+        pre = vis._precompute(times)
+        for body in ("moon", "sun", "earthlimb"):
+            np.testing.assert_array_equal(
+                np.asarray(vis.get_constraint(target_coord, body, times)),
+                np.asarray(vis.get_constraint(target_coord, body, times,
+                                              pre=pre)),
+            )
+
+    def test_disabled_planet_still_queryable(self, vis, target_coord, times):
+        """mars/jupiter can be asked for even when their keep-out is off.
+
+        _precompute only carries the planets whose limit is active, so this
+        exercises the ephemeris fallback.
+        """
+        assert vis.mars_min == 0 * u.deg
+        result = np.asarray(vis.get_constraint(target_coord, "mars", times))
+        assert result.shape == (len(times),)
+        assert result.all()  # a 0 deg keep-out passes everywhere
+
+        separations = vis.get_separations(target_coord, times)
+        assert separations["mars"].unit.is_equivalent(u.deg)
+        assert np.all(separations["mars"].to(u.deg).value >= 0)
+
+    def test_summary_still_renders(self, vis, target_coord, times):
+        """summary() works off the shared precompute."""
+        text = vis.summary(target_coord, times[0])
+        assert "Visibility Summary" in text
+        assert "Earthlimb" in text
+        assert "Star Tracker Constraints" in text
+
+
+class TestEarthlimbRegressionSpotChecks:
+    """Frozen results for the pre-existing (non-dynamic) limb paths.
+
+    These guard the day/night, twilight and default behaviour against
+    accidental changes made while extending the Earth limb constraint.
+    """
+
+    LINE1 = "1 67395U 80229J   26057.99991898  .00000000  00000-0  37770-3 0    03"
+    LINE2 = "2 67395  97.8009  58.3973 0006599 121.8878 132.9207 14.87804761    04"
+
+    @pytest.fixture
+    def times(self):
+        return Time("2026-06-01T00:00:00") + np.arange(3 * 1440) * u.min
+
+    @pytest.fixture
+    def wasp107(self):
+        return SkyCoord(188.386, -10.1462, frame="icrs", unit="deg")
+
+    @pytest.fixture
+    def south_target(self):
+        return SkyCoord(270.0, -66.0, frame="icrs", unit="deg")
+
+    # Every day/night entry names its mode explicitly, so both are pinned
+    # and neither can drift if DAYNIGHT_MODE changes again.  The "mode
+    # implicit" rows pin what the default currently resolves to.
+    @pytest.mark.parametrize("kwargs,expected", [
+        ({}, 2259),
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg,
+              daynight_mode="subsatellite"), 2159),
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg,
+              daynight_mode="limb"), 2626),
+        # mode implicit — must track the "limb" row above
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg), 2626),
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg,
+              twilight_margin=18 * u.deg,
+              daynight_mode="subsatellite"), 1768),
+        # mode implicit, with twilight margin
+        (dict(earthlimb_day_min=40 * u.deg,
+              earthlimb_night_min=5 * u.deg,
+              twilight_margin=18 * u.deg), 2091),
+    ])
+    def test_visible_counts_unchanged(self, times, south_target, kwargs, expected):
+        """Visible-timestep counts for known configurations."""
+        vis = Visibility(self.LINE1, self.LINE2, **kwargs)
+        result = vis.get_visibility(south_target, times)
+        assert int(result.sum()) == expected
+
+    def test_default_wasp107_count(self, times, wasp107):
+        """Default constraints on WASP-107 over three days."""
+        vis = Visibility(self.LINE1, self.LINE2)
+        assert int(vis.get_visibility(wasp107, times).sum()) == 2297
+
+    def test_star_tracker_count(self, times, wasp107):
+        """Star-tracker-constrained visibility is unchanged."""
+        vis = Visibility(
+            self.LINE1, self.LINE2,
+            st_sun_min=44 * u.deg,
+            st_earthlimb_min=30 * u.deg,
+            st_moon_min=12 * u.deg,
+        )
+        assert int(vis.get_visibility(wasp107, times).sum()) == 1033
