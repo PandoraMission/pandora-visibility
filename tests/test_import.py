@@ -142,9 +142,14 @@ def test_edge_cases():
 
     # Test with zero constraints
     vis_zero = Visibility(
-        line1, line2,
-        **{**_LEGACY_DEFAULTS, "moon_min": 0 * u.deg, "sun_min": 0 * u.deg,
-           "earthlimb_min": -90 * u.deg},
+        line1,
+        line2,
+        **{
+            **_LEGACY_DEFAULTS,
+            "moon_min": 0 * u.deg,
+            "sun_min": 0 * u.deg,
+            "earthlimb_min": -90 * u.deg,
+        },
     )
     result = vis_zero.get_visibility(target_coord, time)["visible"]
     assert isinstance(result, bool)

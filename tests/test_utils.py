@@ -2,7 +2,6 @@
 Tests for utils module functions
 """
 
-
 import numpy as np
 import pytest
 from astropy import units as u

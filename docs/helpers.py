@@ -59,9 +59,20 @@ ARCHIVE_TAP_URL = "https://exoplanetarchive.ipac.caltech.edu/TAP/sync"
 
 #: Planet parameters pulled from the archive's composite-parameter table.
 ARCHIVE_COLUMNS = (
-    "pl_name", "hostname", "pl_letter", "ra", "dec", "tran_flag",
-    "pl_tranmid", "pl_orbper", "pl_trandur", "pl_orbeccen", "pl_orblper",
-    "pl_imppar", "pl_ratror", "pl_ratdor",
+    "pl_name",
+    "hostname",
+    "pl_letter",
+    "ra",
+    "dec",
+    "tran_flag",
+    "pl_tranmid",
+    "pl_orbper",
+    "pl_trandur",
+    "pl_orbeccen",
+    "pl_orblper",
+    "pl_imppar",
+    "pl_ratror",
+    "pl_ratdor",
 )
 
 #: Colours for the event overlays drawn behind the visibility bars.
@@ -128,8 +139,7 @@ def _query_archive(where_clause):
         Matching rows, with :data:`ARCHIVE_COLUMNS` as columns.
     """
     query = (
-        f"select {', '.join(ARCHIVE_COLUMNS)} from pscomppars "
-        f"where {where_clause}"
+        f"select {', '.join(ARCHIVE_COLUMNS)} from pscomppars " f"where {where_clause}"
     )
     url = f"{ARCHIVE_TAP_URL}?" + urllib.parse.urlencode(
         {"query": query, "format": "csv"}
@@ -229,9 +239,8 @@ def _conjunction_offset(period, eccentricity, omega):
     """
     if eccentricity <= 0.0:
         return 0.5 * period
-    separation = (
-        _mean_anomaly(-0.5 * np.pi - omega, eccentricity)
-        - _mean_anomaly(0.5 * np.pi - omega, eccentricity)
+    separation = _mean_anomaly(-0.5 * np.pi - omega, eccentricity) - _mean_anomaly(
+        0.5 * np.pi - omega, eccentricity
     )
     return period * (separation % (2.0 * np.pi)) / (2.0 * np.pi)
 
@@ -288,9 +297,7 @@ def planet_ephemeris(record):
     # far enough out of the way at superior conjunction.
     radius_ratio = record["radius_ratio"]
     grazing_limit = 1.0 + (radius_ratio if np.isfinite(radius_ratio) else 0.0)
-    eclipse_occurs = (
-        not np.isfinite(impact) or abs(impact * stretch) < grazing_limit
-    )
+    eclipse_occurs = not np.isfinite(impact) or abs(impact * stretch) < grazing_limit
 
     ephemeris = {
         "transit": {
@@ -361,17 +368,17 @@ def predict_events(ephemeris, coord, times):
     half_duration = 0.5 * ephemeris["duration_hours"] / 24.0
 
     # Epoch numbers whose events can touch the grid, with one spare on each end.
-    first = int(np.floor((times[0].jd - ephemeris["t0_bjd"] - half_duration)
-                         / period)) - 1
-    last = int(np.ceil((times[-1].jd - ephemeris["t0_bjd"] + half_duration)
-                       / period)) + 1
+    first = (
+        int(np.floor((times[0].jd - ephemeris["t0_bjd"] - half_duration) / period)) - 1
+    )
+    last = (
+        int(np.ceil((times[-1].jd - ephemeris["t0_bjd"] + half_duration) / period)) + 1
+    )
     epochs = np.arange(first, last + 1)
     if epochs.size == 0:
         return []
 
-    mid_times = _bjd_tdb_to_utc(
-        ephemeris["t0_bjd"] + epochs * period, coord
-    )
+    mid_times = _bjd_tdb_to_utc(ephemeris["t0_bjd"] + epochs * period, coord)
     grid_jd = times.jd
 
     events = []
@@ -380,14 +387,16 @@ def predict_events(ephemeris, coord, times):
         stop = mid + half_duration * u.day
         if stop.jd < grid_jd[0] or start.jd > grid_jd[-1]:
             continue
-        events.append({
-            "epoch": int(epoch),
-            "mid": mid,
-            "start": start,
-            "stop": stop,
-            "mask": (grid_jd >= start.jd) & (grid_jd <= stop.jd),
-            "clipped": start.jd < grid_jd[0] or stop.jd > grid_jd[-1],
-        })
+        events.append(
+            {
+                "epoch": int(epoch),
+                "mid": mid,
+                "start": start,
+                "stop": stop,
+                "mask": (grid_jd >= start.jd) & (grid_jd <= stop.jd),
+                "clipped": start.jd < grid_jd[0] or stop.jd > grid_jd[-1],
+            }
+        )
     return events
 
 
@@ -458,8 +467,10 @@ def resolve_target(target):
     right_ascension, declination = target
     if isinstance(right_ascension, str):
         coord = SkyCoord(
-            right_ascension, declination,
-            frame="icrs", unit=(u.hourangle, u.deg),
+            right_ascension,
+            declination,
+            frame="icrs",
+            unit=(u.hourangle, u.deg),
         )
     else:
         coord = SkyCoord(right_ascension, declination, frame="icrs", unit=u.deg)
@@ -748,10 +759,12 @@ def draw_event_box(ax, row, segments, color, alpha=0.30):
         what keeps a short event readable on a long axis.
     """
     ax.broken_barh(
-        segments, (row - EVENT_HEIGHT / 2, EVENT_HEIGHT),
+        segments,
+        (row - EVENT_HEIGHT / 2, EVENT_HEIGHT),
         facecolors=to_rgba(color, alpha),
         edgecolors=to_rgba(color, min(1.0, 2.0 * alpha)),
-        linewidth=0.7, zorder=1,
+        linewidth=0.7,
+        zorder=1,
     )
 
 
