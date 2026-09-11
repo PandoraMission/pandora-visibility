@@ -1262,4 +1262,4 @@ plotting = ["matplotlib"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11,<4.0"
-content-hash = "7e5aa1d9c9073e469b926e9d2633a982430c6e074170aa8cfb8b4cab47d2e186"
+content-hash = "c4c097da6c1bb1fcee1c9447cf78b2aa151b1337205a00dcecfcf384fa17e40c"
