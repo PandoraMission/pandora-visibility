@@ -3,11 +3,11 @@ name = "pandoravisibility"
 version = "2.0.0"
 description = "A tool for calculating the visibility of targets from Pandora"
 authors = [
-  {name = 'Tom Barclay', email = 'barclay.astro@gmail.com'},
-  {name = 'Joe P. Renaud', email = 'joseph.p.renaud@nasa.gov'}
-  ]
+  "Tom Barclay <barclay.astro@gmail.com>",
+  "Joe P. Renaud <joseph.p.renaud@nasa.gov>"
+  ]  
 maintainers = [
-  {name = 'Joe P. Renaud', email = 'joseph.p.renaud@nasa.gov'}
+  "Joe P. Renaud <joseph.p.renaud@nasa.gov>"
 ]
 license = "BSD-3-Clause license"
 readme = "README.md"
