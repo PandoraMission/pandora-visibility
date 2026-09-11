@@ -88,9 +88,7 @@ def analyze_yearly_visibility(
     if verbose:
         print("  Computing visibility...")
 
-    visibility_results = np.asarray(
-        vis.get_visibility(target_coord, times)["visible"]
-    )
+    visibility_results = np.asarray(vis.get_visibility(target_coord, times)["visible"])
 
     # Find continuous visibility periods
     continuous_periods = find_continuous_periods(

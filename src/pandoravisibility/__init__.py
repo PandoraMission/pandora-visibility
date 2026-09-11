@@ -5,6 +5,7 @@ TESTDIR = "/".join(PACKAGEDIR.split("/")[:-2]) + "/tests/"
 
 # Find Version Number
 import importlib.metadata
+
 __version__ = importlib.metadata.version("pandoravisibility")
 version = __version__
 
