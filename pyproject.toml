@@ -1,22 +1,36 @@
-[tool.poetry]
+[project]
 name = "pandoravisibility"
-version = "0.1.0"
+version = "2.0.0"
 description = "A tool for calculating the visibility of targets from Pandora"
-authors = ["Tom Barclay <barclay.astro@gmail.com>"]
-license = "BSD-3-Clause license"
 readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["licenses/*"]
+authors = [
+    { name = "Tom Barclay", email = "barclay.astro@gmail.com" },
+    { name = "Joe P. Renaud", email = "joseph.p.renaud@nasa.gov" },
+]
+maintainers = [
+    { name = "Joe P. Renaud", email = "joseph.p.renaud@nasa.gov" },
+]
+requires-python = ">=3.11,<4.0"
+keywords = ["pandora", "astronomy", "spacecraft", "visibility"]
+dependencies = [
+    "numpy>=2.0",
+    "sgp4>=2.25,<3.0",
+    "astropy>=7.0",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.11,<4.0"
-numpy = ">=2.0"
-sgp4 = "^2.25"
-astropy = ">=7.0"
-pandas = "^2.2.3"
-matplotlib = {version = "^3.9", optional = true}
+[project.optional-dependencies]
+plotting = ["matplotlib>=3.9,<4.0"]
 
-[tool.poetry.extras]
-plotting = ["matplotlib"]
+[project.urls]
+Homepage = "https://github.com/PandoraMission/pandora-visibility"
+Repository = "https://github.com/PandoraMission/pandora-visibility"
+Changelog = "https://github.com/PandoraMission/pandora-visibility/blob/main/CHANGES.md"
+Issues = "https://github.com/PandoraMission/pandora-visibility/issues"
 
+[tool.poetry]
+packages = [{ include = "pandoravisibility", from = "src" }]
 
 [tool.poetry.group.dev.dependencies]
 flake8 = "^7.3.0"
@@ -61,5 +75,5 @@ filterwarnings = [
 ]
 
 [build-system]
-requires = ["poetry-core"]
+requires = ["poetry-core>=2.2"]
 build-backend = "poetry.core.masonry.api"
