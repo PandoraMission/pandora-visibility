@@ -272,7 +272,7 @@ class Visibility:
             )
         self.nirda_roi_x = int(custom_limits.get("nirda_roi_x", self.NIRDA_ROI_X))
         self.nirda_roi_y = int(custom_limits.get("nirda_roi_y", self.NIRDA_ROI_Y))
-        # Raises if the ROI cannot hold the target pivot
+        # Raises unless the ROI size is positive
         trace.roi_window(self.nirda_roi_x, self.nirda_roi_y)
         # Neighbor star fields per target and epoch; see _trace_field
         self._trace_field_cache = {}

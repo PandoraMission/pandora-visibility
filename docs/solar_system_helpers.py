@@ -12,7 +12,10 @@ Four groups of functions live here:
   point sources, so ``pandoravisibility.trace`` can draw and score them;
 * the NIRDA field around a target at one time step: the other bodies of its
   system plus Gaia field stars;
-* the same for the VISDA (visible camera) field, for ``pandoravisibility.visda``.
+* the same for the VISDA (visible camera) field, for ``pandoravisibility.visda``;
+* a moon's place in its orbit as seen from Pandora (orbital phase, angle from
+  the line of sight through its planet) and where sunlight could glint off
+  surface liquid (Titan's seas).
 
 The ephemerides are geocentric. Pandora's ~7,000 km offset from the Earth's
 center moves every body of a planetary system by the same ~1 arcsec, so the
@@ -31,6 +34,7 @@ from pandoravisibility import star_field, trace
 
 __all__ = [
     "resolve_body",
+    "is_primary",
     "system_ids",
     "horizons_ephemeris",
     "system_ephemerides",
@@ -39,7 +43,14 @@ __all__ = [
     "pandora_centric",
     "body_samples",
     "system_field",
+    "system_visible_sources",
+    "moon_geometry",
+    "specular_point",
+    "glint_check",
+    "fresnel_reflectance",
+    "illuminated_disk",
     "PLANETS",
+    "DWARF_PLANETS",
     "MAJOR_MOONS",
 ]
 
@@ -48,6 +59,13 @@ HORIZONS_API_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
 
 #: Planets by Horizons id of the body itself (x99), not the system barycenter.
 PLANETS = {"Mars": 499, "Jupiter": 599, "Saturn": 699, "Uranus": 799, "Neptune": 899}
+
+#: Dwarf planets, by Horizons SPK id; each is its own system (no moons drawn).
+DWARF_PLANETS = {"Ceres": 2000001}
+
+#: Horizons COMMAND strings for bodies not looked up by their id. Ceres by its
+#: asteroid number, which (unlike its SPK id) also gives its magnitude.
+_HORIZONS_COMMANDS = {2000001: "1;"}
 
 #: Major moons per planet, by Horizons id.
 MAJOR_MOONS = {
@@ -68,7 +86,14 @@ MAJOR_MOONS = {
 }
 
 #: Polar over equatorial radius, for the shape of a planet's disk.
-POLAR_RATIO = {499: 0.995, 599: 0.935, 699: 0.902, 799: 0.977, 899: 0.983}
+POLAR_RATIO = {
+    499: 0.995,
+    599: 0.935,
+    699: 0.902,
+    799: 0.977,
+    899: 0.983,
+    2000001: 0.925,  # Ceres, from Dawn (446 / 482 km)
+}
 
 #: Main rings drawn, as (inner, outer) radius in planet equatorial radii:
 #: Saturn's B ring inner edge (92,000 km) to A ring outer edge (136,775 km),
@@ -112,20 +137,44 @@ VISIBILITY_CODES = {
 #: Codes whose light is hidden (behind the planet or in its full shadow).
 HIDDEN_CODES = ("O", "P", "u", "U")
 
+#: Refractive index of Titan's lake liquid in the near infrared: a methane-
+#: ethane mix, between liquid methane (~1.27) and liquid ethane (~1.36).
+#: Only sets the glint's brightness (``fresnel_reflectance``), not where it is.
+TITAN_LIQUID_INDEX = 1.29
+
+#: Surface liquid that can glint, per Horizons id: (name, latitude, west
+#: longitude, radius), all in degrees. Each sea or lake is a circle of its
+#: area's equivalent radius about its center (USGS nomenclature, rounded);
+#: the long seas' edges are only roughly matched.
+LIQUID_FEATURES = {
+    606: [
+        ("Kraken Mare", 68.0, 310.0, 10.0),
+        ("Ligeia Mare", 79.0, 248.0, 4.5),
+        ("Punga Mare", 85.0, 340.0, 3.0),
+        ("Jingpo Lacus", 73.0, 336.0, 1.8),
+        ("Ontario Lacus", -72.0, 183.0, 1.5),
+    ],
+}
+
 # Horizons observer quantities: 1 astrometric RA/Dec, 9 visual magnitude,
 # 12 satellite separation and visibility code, 13 angular diameter,
-# 14 sub-observer longitude/latitude, 17 north pole position angle,
-# 20 observer range.
-_QUANTITIES = "1,9,12,13,14,17,20"
+# 14 sub-observer longitude/latitude, 15 sub-solar longitude/latitude,
+# 17 north pole position angle, 20 observer range, 24 Sun-target-observer
+# (phase) angle.
+_QUANTITIES = "1,9,12,13,14,15,17,20,24"
 _COLUMNS = {
-    "R.A._(ICRF)": "ra",
-    "DEC_(ICRF)": "dec",
+    "R.A.___(ICRF)": "ra",
+    "DEC____(ICRF)": "dec",
     "APmag": "vmag",
     "vis.": "code",
     "Ang-diam": "diameter",
+    "ObsSub-LON": "sub_lon",
     "ObsSub-LAT": "sub_lat",
+    "SunSub-LON": "sun_lon",
+    "SunSub-LAT": "sun_lat",
     "NP.ang": "pole_pa",
     "delta": "delta",
+    "S-T-O": "phase_angle",
 }
 
 #: Kilometers per astronomical unit (IAU 2012).
@@ -139,7 +188,7 @@ def resolve_body(name):
     Parameters
     ----------
     name : str or int
-        A name from ``PLANETS`` or ``MAJOR_MOONS`` (any case), or a Horizons
+        A name from ``PLANETS``, ``DWARF_PLANETS`` or ``MAJOR_MOONS`` (any case), or a Horizons
         id such as 606.
 
     Returns
@@ -147,7 +196,7 @@ def resolve_body(name):
     body_id : int
     label : str
     """
-    names = dict(PLANETS)
+    names = {**PLANETS, **DWARF_PLANETS}
     for moons in MAJOR_MOONS.values():
         names.update(moons)
     if isinstance(name, (int, np.integer)):
@@ -159,13 +208,19 @@ def resolve_body(name):
         if label.lower() == str(name).strip().lower():
             return body_id, label
     raise ValueError(
-        f"{name!r} is not a known planet or major moon; choose from " + ", ".join(names)
+        f"{name!r} is not a known planet, dwarf planet or major moon; choose from "
+        + ", ".join(names)
     )
+
+
+def is_primary(body_id):
+    """True for a planet or dwarf planet, False for a moon."""
+    return body_id % 100 == 99 or body_id in DWARF_PLANETS.values()
 
 
 def system_ids(body_id):
     """Ids of a body's system: its primary first, then the primary's moons."""
-    primary = body_id if body_id % 100 == 99 else (body_id // 100) * 100 + 99
+    primary = body_id if is_primary(body_id) else (body_id // 100) * 100 + 99
     return [primary] + list(MAJOR_MOONS.get(primary, {}).values())
 
 
@@ -187,14 +242,18 @@ def horizons_ephemeris(body_id, start_utc, stop_utc, step_minutes):
     dict of np.ndarray
         jd (UT), ra and dec (astrometric ICRF, deg), vmag, code (Horizons
         visibility code, see ``VISIBILITY_CODES``), diameter (arcsec),
-        sub_lat (sub-observer latitude, deg; the ring opening angle for a
-        ringed planet), pole_pa (north pole position angle, deg east of
-        north) and delta (distance from the Earth's center, au). Values
-        Horizons does not provide are NaN.
+        sub_lon and sub_lat (sub-observer point, deg; sub_lat is the ring
+        opening angle for a ringed planet), sun_lon and sun_lat (sub-solar
+        point, deg), pole_pa (north pole position angle, deg east of north),
+        delta (distance from the Earth's center, au) and phase_angle
+        (Sun-body-Earth angle, deg). Longitudes are in the body's own
+        convention (west-positive for Titan and the planets, east-positive
+        for Ceres). Values Horizons
+        does not provide are NaN.
     """
     params = {
         "format": "json",
-        "COMMAND": f"'{body_id}'",
+        "COMMAND": f"'{_HORIZONS_COMMANDS.get(body_id, body_id)}'",
         "OBJ_DATA": "NO",
         "MAKE_EPHEM": "YES",
         "EPHEM_TYPE": "OBSERVER",
@@ -206,6 +265,9 @@ def horizons_ephemeris(body_id, start_utc, stop_utc, step_minutes):
         "ANG_FORMAT": "DEG",
         "CSV_FORMAT": "YES",
         "CAL_FORMAT": "JD",
+        # RA/Dec to 1e-9 deg (~0.1 km at Saturn) instead of 1e-5 (~200 km),
+        # which moon_geometry needs for the moons' motion about the planet
+        "EXTRA_PREC": "YES",
     }
     url = f"{HORIZONS_API_URL}?" + urllib.parse.urlencode(params)
     with urllib.request.urlopen(url, timeout=120) as response:
@@ -258,19 +320,29 @@ def system_ephemerides(target_ids, start_utc, stop_utc, step_minutes, times):
             )
             nearest = np.where(before_closer, after - 1, after)
             sampled = {"code": raw["code"][nearest]}
-            # RA through its unit vector, so 0/360 deg wraps interpolate cleanly
-            for key in ("dec", "vmag", "diameter", "sub_lat", "pole_pa", "delta"):
+            for key in (
+                "dec",
+                "vmag",
+                "diameter",
+                "sub_lat",
+                "sun_lat",
+                "pole_pa",
+                "delta",
+                "phase_angle",
+            ):
                 sampled[key] = np.interp(times.jd, raw["jd"], raw[key])
-            ra = np.deg2rad(raw["ra"])
-            sampled["ra"] = (
-                np.rad2deg(
-                    np.arctan2(
-                        np.interp(times.jd, raw["jd"], np.sin(ra)),
-                        np.interp(times.jd, raw["jd"], np.cos(ra)),
+            # Angles that wrap at 360 deg go through their unit vectors
+            for key in ("ra", "sub_lon", "sun_lon"):
+                angle = np.deg2rad(raw[key])
+                sampled[key] = (
+                    np.rad2deg(
+                        np.arctan2(
+                            np.interp(times.jd, raw["jd"], np.sin(angle)),
+                            np.interp(times.jd, raw["jd"], np.cos(angle)),
+                        )
                     )
+                    % 360.0
                 )
-                % 360.0
-            )
             ephemerides[body_id] = sampled
     return ephemerides
 
@@ -315,26 +387,34 @@ def pandora_centric(ephemeris, visibility, times):
     ra, dec : np.ndarray
         Pandora-centric position in degrees, one per time.
     """
-    spacecraft = (
-        visibility.get_state(times)
-        .transform_to(GCRS(obstime=times))
-        .cartesian.xyz.to_value(u.km)
-    )
-    ra = np.deg2rad(ephemeris["ra"])
-    dec = np.deg2rad(ephemeris["dec"])
-    distance = ephemeris["delta"] * _AU_KM
-    body = distance * np.array(
-        [np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)]
-    )
-    x, y, z = body - spacecraft
+    x, y, z = _geocentric_position(ephemeris) - _spacecraft_position(visibility, times)
     return np.rad2deg(np.arctan2(y, x)) % 360.0, np.rad2deg(
         np.arctan2(z, np.hypot(x, y))
     )
 
 
+def _spacecraft_position(visibility, times):
+    """Pandora's geocentric position (km, ICRS axes), shape (3, n)."""
+    return (
+        visibility.get_state(times)
+        .transform_to(GCRS(obstime=times))
+        .cartesian.xyz.to_value(u.km)
+    )
+
+
+def _geocentric_position(ephemeris):
+    """A body's geocentric position (km, ICRS axes) from RA, Dec and range."""
+    ra = np.deg2rad(ephemeris["ra"])
+    dec = np.deg2rad(ephemeris["dec"])
+    distance = ephemeris["delta"] * _AU_KM
+    return distance * np.array(
+        [np.cos(dec) * np.cos(ra), np.cos(dec) * np.sin(ra), np.sin(dec)]
+    )
+
+
 def is_clear(body_id, ephemeris):
     """Per-step flag: True where a moon is free and clear (planets always)."""
-    if body_id % 100 == 99:
+    if is_primary(body_id):
         return np.ones(len(ephemeris["code"]), dtype=bool)
     return ephemeris["code"] == "*"
 
@@ -570,4 +650,233 @@ def system_visible_sources(
         "bp_rp": np.concatenate(bp_rp),
         "weight": np.concatenate(weight),
         "label": label,
+    }
+
+
+def moon_geometry(moon_id, ephemerides, visibility, times):
+    """
+    Where a moon is in its orbit, as seen from Pandora.
+
+    Positions are Pandora-centric (see ``pandora_centric``). The orbit
+    normal is fit once from the moon's motion about its planet over the
+    whole grid, so ``times`` needs at least two steps, less than half an
+    orbit apart.
+
+    Parameters
+    ----------
+    moon_id : int
+        Horizons id of the moon.
+    ephemerides : dict
+        From ``system_ephemerides``; must hold the moon and its planet.
+    visibility : pandoravisibility.Visibility
+        Supplies the spacecraft orbit.
+    times : astropy.time.Time
+        The notebook time grid.
+
+    Returns
+    -------
+    dict of np.ndarray
+        host_angle : angle at the planet between the moon and Pandora (deg):
+            0 when the moon is straight in front of the planet, 180 straight
+            behind it.
+        orbital_phase : the moon's orbital phase (deg, 0 to 360) counted
+            from in front of the planet (inferior conjunction) in its
+            direction of motion: 90 and 270 are the greatest elongations,
+            180 is behind the planet.
+    """
+    spacecraft = _spacecraft_position(visibility, times)
+    planet = _geocentric_position(ephemerides[system_ids(moon_id)[0]]) - spacecraft
+    moon = _geocentric_position(ephemerides[moon_id]) - spacecraft
+    offset = moon - planet  # planet to moon, km
+    toward_pandora = -planet / np.linalg.norm(planet, axis=0)
+    radial = offset / np.linalg.norm(offset, axis=0)
+    host_angle = np.rad2deg(
+        np.arccos(np.clip((radial * toward_pandora).sum(axis=0), -1.0, 1.0))
+    )
+
+    # One orbit normal from r x dr summed over the grid (the plane barely
+    # moves over days), then the phase within that plane from the line of
+    # sight's projection onto it
+    normal = np.cross(offset[:, :-1], offset[:, 1:], axis=0).sum(axis=1)
+    normal = (normal / np.linalg.norm(normal))[:, np.newaxis]
+    reference = toward_pandora - (toward_pandora * normal).sum(axis=0) * normal
+    reference /= np.linalg.norm(reference, axis=0)
+    orbital_phase = np.rad2deg(
+        np.arctan2(
+            (np.cross(reference, radial, axis=0) * normal).sum(axis=0),
+            (reference * radial).sum(axis=0),
+        )
+    )
+    return {"host_angle": host_angle, "orbital_phase": orbital_phase % 360.0}
+
+
+def specular_point(ephemeris):
+    """
+    Point on a body where sunlight reflects specularly toward the observer.
+
+    On a sphere this is where the surface normal bisects the directions to
+    the Sun and to the observer: the midpoint of the sub-solar and
+    sub-observer points. The angle of incidence there is half the phase
+    angle. The observer is the Earth's center, which for any body beyond the
+    Moon is the same as Pandora to well under 0.01 deg.
+
+    Parameters
+    ----------
+    ephemeris : dict
+        The body's sampled ephemeris (see ``system_ephemerides``).
+
+    Returns
+    -------
+    latitude, longitude, incidence : np.ndarray
+        Specular point latitude and longitude (deg, the body's longitude
+        convention) and the angle of incidence there (deg).
+    """
+
+    def unit(lat, lon):
+        lat, lon = np.deg2rad(lat), np.deg2rad(lon)
+        return np.array(
+            [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)]
+        )
+
+    bisector = unit(ephemeris["sub_lat"], ephemeris["sub_lon"]) + unit(
+        ephemeris["sun_lat"], ephemeris["sun_lon"]
+    )
+    x, y, z = bisector / np.linalg.norm(bisector, axis=0)
+    return (
+        np.rad2deg(np.arctan2(z, np.hypot(x, y))),
+        np.rad2deg(np.arctan2(y, x)) % 360.0,
+        0.5 * ephemeris["phase_angle"],
+    )
+
+
+def glint_check(body_id, ephemeris, tolerance_deg):
+    """
+    Whether the specular point falls on known surface liquid.
+
+    A glint is possible when the specular point (``specular_point``) lies
+    within ``tolerance_deg`` of the edge of a feature in
+    ``LIQUID_FEATURES``. The tolerance stands in for everything that spreads
+    a real glint beyond one point: wave slopes, the Sun's width, scattering
+    in the atmosphere, and the rough circular outlines used here.
+
+    Parameters
+    ----------
+    body_id : int
+        Horizons id.
+    ephemeris : dict
+        The body's sampled ephemeris (see ``system_ephemerides``).
+    tolerance_deg : float
+        Allowed distance from a feature's edge, in degrees of arc on the
+        body.
+
+    Returns
+    -------
+    possible : np.ndarray of bool
+        True where a glint is possible. All False for a body without known
+        surface liquid.
+    nearest : np.ndarray of str
+        Name of the feature whose edge is closest ("" without features).
+    distance : np.ndarray
+        Arc from the specular point to that feature's edge, deg (NaN without
+        features; negative inside it).
+    """
+    latitude, longitude, _ = specular_point(ephemeris)
+    n_time = len(latitude)
+    features = LIQUID_FEATURES.get(body_id, [])
+    if not features:
+        return np.zeros(n_time, bool), np.full(n_time, ""), np.full(n_time, np.nan)
+    lat = np.deg2rad(latitude)[:, np.newaxis]
+    lon = np.deg2rad(longitude)[:, np.newaxis]
+    feature_lat = np.deg2rad([feature[1] for feature in features])
+    feature_lon = np.deg2rad([feature[2] for feature in features])
+    radius = np.array([feature[3] for feature in features])
+    arc = np.rad2deg(
+        np.arccos(
+            np.clip(
+                np.sin(lat) * np.sin(feature_lat)
+                + np.cos(lat) * np.cos(feature_lat) * np.cos(lon - feature_lon),
+                -1.0,
+                1.0,
+            )
+        )
+    )
+    beyond_edge = arc - radius
+    closest = np.argmin(beyond_edge, axis=1)
+    distance = beyond_edge[np.arange(n_time), closest]
+    names = np.array([feature[0] for feature in features])
+    return distance <= tolerance_deg, names[closest], distance
+
+
+def fresnel_reflectance(incidence_deg, refractive_index=TITAN_LIQUID_INDEX):
+    """
+    Fraction of unpolarized light a smooth liquid surface reflects.
+
+    Parameters
+    ----------
+    incidence_deg : array_like
+        Angle of incidence from the surface normal, deg.
+    refractive_index : float
+        Of the liquid, relative to the gas above it (default
+        ``TITAN_LIQUID_INDEX``).
+
+    Returns
+    -------
+    np.ndarray
+        Reflectance, the mean of the s and p polarizations.
+    """
+    incidence = np.deg2rad(np.asarray(incidence_deg, dtype=float))
+    cos_i = np.cos(incidence)
+    cos_t = np.sqrt(1.0 - (np.sin(incidence) / refractive_index) ** 2)
+    r_s = (cos_i - refractive_index * cos_t) / (cos_i + refractive_index * cos_t)
+    r_p = (cos_t - refractive_index * cos_i) / (cos_t + refractive_index * cos_i)
+    return 0.5 * (r_s**2 + r_p**2)
+
+
+def illuminated_disk(body_id, ephemeris):
+    """
+    How much of a body's disk is sunlit as seen by the observer.
+
+    The lit share of the disk is (1 + cos(phase angle)) / 2, the area
+    between the limb and the terminator's ellipse. The disk is the body's
+    outline from Horizons' angular diameter (the solid surface: Titan's haze
+    reaches higher), flattened by ``POLAR_RATIO`` as seen from the
+    sub-observer latitude. Steps where Horizons has the body behind its
+    planet or fully in its shadow (``HIDDEN_CODES``) count as unlit. Not
+    modeled: partial occultations and eclipses (Horizons ``p``), the planet
+    in front of a transiting moon's background, and Saturn's rings.
+
+    Parameters
+    ----------
+    body_id : int
+        Horizons id.
+    ephemeris : dict
+        The body's sampled ephemeris (see ``system_ephemerides``).
+
+    Returns
+    -------
+    dict of np.ndarray
+        lit_fraction : sunlit share of the disk (0 where hidden).
+        lit_area_arcsec2 : sunlit area on the sky, square arcsec.
+        lit_area_km2 : the same projected onto the body, square km.
+        hidden : True where Horizons has the body occulted or fully eclipsed.
+        partial : True during a partial eclipse, whose loss is not modeled.
+    """
+    semi_major = 0.5 * ephemeris["diameter"]  # arcsec
+    sub_lat = np.deg2rad(ephemeris["sub_lat"])
+    polar = POLAR_RATIO.get(body_id, 1.0)
+    semi_minor = semi_major * np.sqrt(
+        (polar * np.cos(sub_lat)) ** 2 + np.sin(sub_lat) ** 2
+    )
+    hidden = np.isin(ephemeris["code"], HIDDEN_CODES)
+    fraction = np.where(
+        hidden, 0.0, 0.5 * (1.0 + np.cos(np.deg2rad(ephemeris["phase_angle"])))
+    )
+    area = fraction * np.pi * semi_major * semi_minor
+    km_per_arcsec = ephemeris["delta"] * _AU_KM * np.pi / 648000.0
+    return {
+        "lit_fraction": fraction,
+        "lit_area_arcsec2": area,
+        "lit_area_km2": area * km_per_arcsec**2,
+        "hidden": hidden,
+        "partial": ephemeris["code"] == "p",
     }

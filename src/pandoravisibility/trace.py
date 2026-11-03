@@ -34,6 +34,7 @@ __all__ = [
     "trace_position_angle",
     "detector_offsets",
     "lsf_cdf",
+    "pivot_in_roi",
     "roi_window",
     "contamination_vs_roll",
     "robust_contamination",
@@ -55,9 +56,15 @@ ROLL_TO_TRACE_PA_SIGN = -1
 ROLL_TO_TRACE_PA_OFFSET = -6.339  # deg
 # Parity of the detector column axis (measured on orbit; as in pandoraref).
 COLUMN_SIGN = +1
-# Target pivot (row, column) inside the NIRDA ROI, measured in the 2026-10-15
-# V1298 Tau frame (pandoraref CRPIX predicts (125, 43)).
+# Target pivot (row, column) inside the flight NIRDA ROI (FLIGHT_ROI columns x
+# rows), measured in the 2026-10-15 V1298 Tau frame (pandoraref CRPIX predicts
+# (125, 43)). Any other ROI size centers the target's trace instead; see
+# pivot_in_roi.
+FLIGHT_ROI = (80, 256)
 PIVOT_IN_ROI = (124, 39)
+# The target's trace may sit no further than this from the ROI's right edge
+# (highest column), in pixels.
+PIVOT_MAX_FROM_RIGHT = 225
 
 # =====================================================================================
 # Trace and extraction geometry (pixels from the pivot)
@@ -164,6 +171,41 @@ def _lsf_density(col_offset):
     return (1.0 - LSF_WING_FRACTION) * core + LSF_WING_FRACTION * wing
 
 
+def pivot_in_roi(roi_x: int, roi_y: int):
+    """Target pivot (row, column) inside a NIRDA ROI.
+
+    The flight ROI (``FLIGHT_ROI``) keeps the pivot measured on orbit,
+    ``PIVOT_IN_ROI``. Any other size centers the target's trace (its full
+    extent, ``TRACE_ROW_MIN`` to ``TRACE_ROW_MAX``) in the rows and the
+    trace in the columns, except that the trace stays within
+    ``PIVOT_MAX_FROM_RIGHT`` pixels of the right edge.
+
+    Parameters
+    ----------
+    roi_x, roi_y : int
+        NIRDA ROI size in columns (cross-dispersion) and rows (dispersion).
+
+    Returns
+    -------
+    row, col : int
+        Pivot pixel, counted from the ROI's first row and column.
+
+    Raises
+    ------
+    ValueError
+        If either size is not positive.
+    """
+    if roi_x < 1 or roi_y < 1:
+        raise ValueError(f"NIRDA ROI size must be positive, got {roi_x} x {roi_y}")
+    if (roi_x, roi_y) == FLIGHT_ROI:
+        return PIVOT_IN_ROI
+    trace_middle = 0.5 * (TRACE_ROW_MIN + TRACE_ROW_MAX)
+    row = int(np.floor(0.5 * (roi_y - 1) - trace_middle + 0.5))
+    col = int(np.floor(0.5 * (roi_x - 1) + 0.5))
+    col = max(col, roi_x - 1 - PIVOT_MAX_FROM_RIGHT)
+    return row, col
+
+
 def roi_window(roi_x: int, roi_y: int):
     """Extraction rows and aperture column limits, clipped to the read-out ROI.
 
@@ -171,7 +213,7 @@ def roi_window(roi_x: int, roi_y: int):
     ----------
     roi_x, roi_y : int
         NIRDA ROI size in columns (cross-dispersion) and rows (dispersion).
-        The pivot sits at ``PIVOT_IN_ROI`` inside it.
+        The pivot sits at ``pivot_in_roi`` inside it.
 
     Returns
     -------
@@ -183,14 +225,9 @@ def roi_window(roi_x: int, roi_y: int):
     Raises
     ------
     ValueError
-        If the ROI does not contain the pivot.
+        If either size is not positive.
     """
-    pivot_row, pivot_col = PIVOT_IN_ROI
-    if roi_y <= pivot_row or roi_x <= pivot_col:
-        raise ValueError(
-            f"a {roi_x} x {roi_y} NIRDA ROI does not contain the target pivot at "
-            f"(row {pivot_row}, column {pivot_col})"
-        )
+    pivot_row, pivot_col = pivot_in_roi(roi_x, roi_y)
     row_low = max(EXTRACTION_ROW_MIN, -pivot_row)
     row_high = min(EXTRACTION_ROW_MAX, roi_y - 1 - pivot_row)
     rows = np.arange(np.ceil(row_low), np.floor(row_high) + 1.0)
@@ -330,7 +367,6 @@ def render_roi(field: dict, roll_deg: float, roi_x: int, roi_y: int):
     np.ndarray
         (roi_y, roi_x) image, row index first.
     """
-    roi_window(roi_x, roi_y)  # validates that the ROI holds the pivot
     shape = field.get("target_shape") or {"xi": [0.0], "eta": [0.0], "weight": [1.0]}
     star_row, star_col = detector_offsets(
         np.concatenate(
@@ -345,7 +381,7 @@ def render_roi(field: dict, roll_deg: float, roi_x: int, roi_y: int):
         [np.asarray(shape["weight"], float), np.asarray(field["flux_ratio"], float)]
     )
     # Only sources whose trace (with a few pixels of LSF) touches the ROI
-    pivot_row, pivot_col = PIVOT_IN_ROI
+    pivot_row, pivot_col = pivot_in_roi(roi_x, roi_y)
     touches = (
         (star_col > -pivot_col - 10)
         & (star_col < roi_x - pivot_col + 10)
@@ -440,9 +476,10 @@ def plot_trace(
         aspect="equal",
     )
     rows, col_low, col_high = roi_window(roi_x, roi_y)
+    pivot_row, pivot_col = pivot_in_roi(roi_x, roi_y)
     ax.add_patch(
         Rectangle(
-            (PIVOT_IN_ROI[1] + col_low, PIVOT_IN_ROI[0] + rows[0] - 0.5),
+            (pivot_col + col_low, pivot_row + rows[0] - 0.5),
             col_high - col_low,
             rows[-1] - rows[0] + 1.0,
             fill=False,
@@ -458,9 +495,9 @@ def plot_trace(
         )
         # Image pixel coordinates of each trace: its column, and the rows it
         # spans clipped to the ROI
-        column = PIVOT_IN_ROI[1] + star_col
-        row_low = np.clip(PIVOT_IN_ROI[0] + star_row + TRACE_ROW_MIN, 0, roi_y - 1)
-        row_high = np.clip(PIVOT_IN_ROI[0] + star_row + TRACE_ROW_MAX, 0, roi_y - 1)
+        column = pivot_col + star_col
+        row_low = np.clip(pivot_row + star_row + TRACE_ROW_MIN, 0, roi_y - 1)
+        row_high = np.clip(pivot_row + star_row + TRACE_ROW_MAX, 0, roi_y - 1)
         in_roi = (column >= -0.5) & (column <= roi_x - 0.5) & (row_high > row_low)
         labels = field.get("label")
         if labels is None:

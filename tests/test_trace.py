@@ -282,18 +282,36 @@ class TestTraceGeometry:
             trace.lsf_cdf([-50.0, 0.0, 50.0]), [0.0, 0.5, 1.0], atol=1e-9
         )
 
-    def test_roi_must_contain_pivot(self):
-        """An ROI too small to hold the pivot is rejected."""
-        row, col = trace.PIVOT_IN_ROI
-        with pytest.raises(ValueError, match="pivot"):
-            trace.roi_window(80, row)
-        with pytest.raises(ValueError, match="pivot"):
-            trace.roi_window(col, 256)
+    def test_roi_must_be_positive(self):
+        """An empty ROI is rejected."""
+        with pytest.raises(ValueError, match="positive"):
+            trace.roi_window(80, 0)
+        with pytest.raises(ValueError, match="positive"):
+            trace.roi_window(0, 256)
+
+    def test_pivot_flight_roi_measured_others_centered(self):
+        """The flight ROI keeps the measured pivot; other sizes center the trace."""
+        assert trace.pivot_in_roi(*trace.FLIGHT_ROI) == trace.PIVOT_IN_ROI
+        row, col = trace.pivot_in_roi(160, 512)
+        assert col in (79, 80)
+        # Trace extent centered in the rows to within a pixel
+        top = row + trace.TRACE_ROW_MAX
+        bottom = row + trace.TRACE_ROW_MIN
+        assert abs((511 - top) - bottom) <= 1.0
+        assert trace.pivot_in_roi(81, 256)[1] == 40
+
+    def test_pivot_kept_near_right_edge(self):
+        """A wide ROI holds the trace PIVOT_MAX_FROM_RIGHT from its right edge."""
+        _, col = trace.pivot_in_roi(450, 256)
+        assert col == 225  # centered: 224 from the right edge
+        _, col = trace.pivot_in_roi(2048, 2048)
+        assert 2047 - col == trace.PIVOT_MAX_FROM_RIGHT
 
     def test_roi_clips_extraction_rows(self):
         """Rows outside the read-out ROI are not extracted."""
         rows, _, _ = trace.roi_window(80, 150)
-        assert rows[-1] == 150 - 1 - trace.PIVOT_IN_ROI[0]
+        assert rows[-1] == 150 - 1 - trace.pivot_in_roi(80, 150)[0]
+        assert rows[0] == -trace.pivot_in_roi(80, 150)[0]
         rows, col_low, col_high = trace.roi_window(80, 256)
         assert (rows[0], rows[-1]) == (-97.0, 97.0)
         assert (col_low, col_high) == (
@@ -352,7 +370,9 @@ class TestContamination:
         # Pivot 150 rows up the dispersion: covers rows 43 to 261 from the pivot
         field = _field(0.0, 150 * trace.NIRDA_PIXEL_SCALE, 1.0)
         assert trace.contamination_vs_roll([_NORTH_ROLL], field, 80, 256)[0] > 0.5
-        assert trace.contamination_vs_roll([_NORTH_ROLL], field, 80, 160)[0] == 0.0
+        # A 60-row ROI reads only up to 32 rows above its centered pivot
+        assert 60 - 1 - trace.pivot_in_roi(80, 60)[0] < 43 - trace.TRACE_END_PAD
+        assert trace.contamination_vs_roll([_NORTH_ROLL], field, 80, 60)[0] == 0.0
 
 
 class TestRendering:
@@ -533,11 +553,11 @@ class TestRollSearchWithTrace:
             assert result[key].shape == (2, 50), key
 
     def test_kwarg_validation(self):
-        """A non-positive tolerance or an ROI without the pivot is rejected."""
+        """A non-positive tolerance or ROI size is rejected."""
         with pytest.raises(ValueError, match="trace_contamination_tol"):
             Visibility(_LINE1, _LINE2, trace_contamination_tol=0.0)
-        with pytest.raises(ValueError, match="pivot"):
-            Visibility(_LINE1, _LINE2, nirda_roi_y=100)
+        with pytest.raises(ValueError, match="positive"):
+            Visibility(_LINE1, _LINE2, nirda_roi_y=0)
         vis = Visibility(_LINE1, _LINE2, nirda_roi_x=64, nirda_roi_y=200)
         assert (vis.nirda_roi_x, vis.nirda_roi_y) == (64, 200)
 
